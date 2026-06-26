@@ -265,6 +265,8 @@ pub enum PluginSubCommand {
     Info(String),
     /// `/plugin install <path>` — install a plugin from a local path.
     Install(String),
+    /// `/plugin marketplace <query>` — search or install from the marketplace.
+    Marketplace(String),
     /// `/plugin reload` — reload plugins from disk.
     Reload,
     /// Show usage / help.
@@ -291,6 +293,9 @@ pub fn parse_plugin_args(args: &str) -> PluginSubCommand {
             parts.get(1).unwrap_or(&"").to_string(),
         ),
         Some("install") | Some("i") => PluginSubCommand::Install(
+            parts.get(1).unwrap_or(&"").to_string(),
+        ),
+        Some("marketplace") | Some("add") | Some("search") => PluginSubCommand::Marketplace(
             parts.get(1).unwrap_or(&"").to_string(),
         ),
         Some("reload") | Some("refresh") => PluginSubCommand::Reload,
@@ -497,6 +502,57 @@ pub fn install_plugin_from_path(
     );
 
     Ok(plugin_name)
+}
+
+/// Install a plugin from a marketplace identifier, GitHub repo, or URL.
+///
+/// Handles:
+/// - `owner/repo` — GitHub repo (default branch)
+/// - `owner/repo@branch` — GitHub repo (specific branch)
+/// - `owner/repo@tag` — GitHub repo (release)
+/// - `https://github.com/owner/repo` — GitHub URL
+/// - `https://github.com/owner/repo/archive/refs/heads/main.zip` — Direct archive URL
+pub async fn install_plugin_from_marketplace(id_or_url: &str) -> Result<String, String> {
+    use marketplace::{marketplace_install, MarketplaceEntry};
+
+    if id_or_url.is_empty() {
+        return Err("Provide a plugin name, GitHub repo (owner/repo), or URL".to_string());
+    }
+
+    // Parse the input to determine what kind of install this is
+    let install_target = if id_or_url.starts_with("http") {
+        // Direct URL - use as-is
+        id_or_url.to_string()
+    } else if id_or_url.contains('/') {
+        // GitHub shorthand: owner/repo[@tag]
+        let entry = marketplace::install_from_github(id_or_url, None).await?;
+        entry.download_url
+    } else {
+        // Try marketplace search
+        let results = marketplace::marketplace_search(id_or_url).await?;
+        if results.is_empty() {
+            return Err(format!("No plugin found in marketplace for '{}'", id_or_url));
+        }
+        // Install the first match
+        let entry = &results[0];
+        marketplace::marketplace_install(&entry.download_url).await?;
+        return Ok(entry.name.clone());
+    };
+
+    // Download and install
+    let entry = MarketplaceEntry {
+        name: install_target.split('/').last().unwrap_or("plugin").to_string(),
+        version: "0.0.0".to_string(),
+        description: String::new(),
+        author: String::new(),
+        download_url: install_target,
+        hash: String::new(),
+        tags: Vec::new(),
+        updated_at: None,
+    };
+
+    marketplace::marketplace_install(&entry.download_url).await?;
+    Ok(entry.name)
 }
 
 /// Recursively copy a directory.

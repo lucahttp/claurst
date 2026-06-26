@@ -16,6 +16,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
+use regex;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
@@ -1590,6 +1591,36 @@ impl PromptInputState {
         std::mem::take(&mut self.pending_images)
     }
 
+    /// Resolve paste placeholders back to their original content.
+    ///
+    /// When multi-line text is pasted, it is stored in `paste_contents` and a
+    /// placeholder like `[Pasted ~12 lines #3]` is shown in the prompt.  This
+    /// method replaces all such placeholders with the original content for
+    /// submission.  Does NOT modify `paste_contents` — use `clear_paste_contents`
+    /// after successful message send.
+    pub fn get_resolved_text(&self) -> String {
+        let mut result = self.text.clone();
+        // Pattern: [Pasted ~<N> lines #<M>]
+        // Group 1 = line count, Group 2 = paste_id (key into paste_contents).
+        let pattern = regex::Regex::new(r"\[Pasted ~(\d+) lines #(\d+)\]").unwrap();
+
+        for cap in pattern.captures_iter(&result) {
+            if let Ok(paste_id) = cap[2].parse::<u32>() {
+                if let Some(content) = self.paste_contents.get(&paste_id) {
+                    result = result.replace(&cap[0], content);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Clear all stored paste contents.  Called after a message is successfully
+    /// submitted so the same paste cannot be accidentally sent twice.
+    pub fn clear_paste_contents(&mut self) {
+        self.paste_contents.clear();
+    }
+
     /// Insert a character at cursor position.
     pub fn insert_char(&mut self, c: char) {
         if self.mode == InputMode::Readonly { return; }
@@ -2571,9 +2602,11 @@ impl PromptInputState {
         self.vim_search_buf.clear();
     }
 
-    /// Take the current text, clearing the input.
+    /// Take the current text, resolving any paste placeholders and clearing the input.
+    /// Paste contents are cleared after resolution to prevent double-use.
     pub fn take(&mut self) -> String {
-        let text = self.text.clone();
+        let text = self.get_resolved_text();
+        self.paste_contents.clear();
         self.clear();
         text
     }

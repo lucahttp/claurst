@@ -2670,7 +2670,7 @@ impl App {
     }
 
     fn sync_legacy_prompt_fields(&mut self) {
-        self.input = self.prompt_input.text.clone();
+        self.input = self.prompt_input.get_resolved_text();
         self.cursor_pos = self.prompt_input.cursor;
         self.history_index = self.prompt_input.history_pos;
     }

@@ -1914,16 +1914,17 @@ impl SlashCommand for PluginCommand {
     fn aliases(&self) -> Vec<&str> { vec!["plugins"] }
     fn description(&self) -> &str { "Manage plugins" }
     fn help(&self) -> &str {
-        "Usage: /plugin [list|info <name>|enable <name>|disable <name>|install <path>|reload]\n\
+        "Usage: /plugin [list|info <name>|enable <name>|disable <name>|install <path>|marketplace <query>|reload]\n\
          Manage Claurst plugins.\n\n\
          Subcommands:\n\
-           /plugin              — list all installed plugins\n\
-           /plugin list         — list all installed plugins\n\
-           /plugin info <name>  — show detailed info about a plugin\n\
-           /plugin enable <name>   — enable a plugin (persisted to settings)\n\
-           /plugin disable <name>  — disable a plugin (persisted to settings)\n\
-           /plugin install <path>  — install a plugin from a local directory\n\
-           /plugin reload       — reload plugins from disk"
+           /plugin                  — list all installed plugins\n\
+           /plugin list             — list all installed plugins\n\
+           /plugin info <name>      — show detailed info about a plugin\n\
+           /plugin enable <name>    — enable a plugin (persisted to settings)\n\
+           /plugin disable <name>   — disable a plugin (persisted to settings)\n\
+           /plugin install <path>   — install a plugin from a local directory\n\
+           /plugin marketplace <id> — install from marketplace or GitHub (e.g. owner/repo)\n\
+           /plugin reload          — reload plugins from disk"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -2025,6 +2026,29 @@ impl SlashCommand for PluginCommand {
                     Err(e) => CommandResult::Error(format!("Install failed: {}", e)),
                 }
             }
+            claurst_plugins::PluginSubCommand::Marketplace(ref query) if query.is_empty() => {
+                CommandResult::Error(
+                    "Usage: /plugin marketplace <name-or-repo>\n\
+                     \n\
+                     Install a plugin from the marketplace or GitHub:\n\
+                       /plugin marketplace add microsoft/skills-for-copilot-studio\n\
+                       /plugin marketplace add owner/repo\n\
+                       /plugin marketplace add https://github.com/owner/repo\n\
+                     \n\
+                     Run `/plugin list` to see installed plugins."
+                        .to_string(),
+                )
+            }
+            claurst_plugins::PluginSubCommand::Marketplace(query) => {
+                let result = claurst_plugins::install_plugin_from_marketplace(query).await;
+                match result {
+                    Ok(name) => CommandResult::Message(format!(
+                        "Plugin '{}' installed successfully. Run `/plugin reload` to activate it.",
+                        name
+                    )),
+                    Err(e) => CommandResult::Error(format!("Marketplace install failed: {}", e)),
+                }
+            }
             claurst_plugins::PluginSubCommand::Reload => {
                 let old_registry = get_registry(&project_dir).await;
                 let (new_registry, diff) =
@@ -2034,13 +2058,14 @@ impl SlashCommand for PluginCommand {
             claurst_plugins::PluginSubCommand::Help => {
                 CommandResult::Message(
                     "Plugin commands:\n\
-                     /plugin              — list all installed plugins\n\
-                     /plugin list         — list all installed plugins\n\
-                     /plugin info <name>  — show plugin details\n\
-                     /plugin enable <name>   — enable a plugin\n\
-                     /plugin disable <name>  — disable a plugin\n\
-                     /plugin install <path>  — install plugin from local path\n\
-                     /plugin reload       — reload plugins from disk"
+                     /plugin                  — list all installed plugins\n\
+                     /plugin list             — list all installed plugins\n\
+                     /plugin info <name>      — show plugin details\n\
+                     /plugin enable <name>    — enable a plugin\n\
+                     /plugin disable <name>   — disable a plugin\n\
+                     /plugin install <path>   — install plugin from local path\n\
+                     /plugin marketplace <id> — install from marketplace or GitHub\n\
+                     /plugin reload          — reload plugins from disk"
                         .to_string(),
                 )
             }

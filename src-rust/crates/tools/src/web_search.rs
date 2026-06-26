@@ -1,9 +1,11 @@
-// WebSearch tool: search the web using Brave Search API or fallback to DuckDuckGo.
+// WebSearch tool: search the web using SearXNG, Brave Search API, or fallback to DuckDuckGo.
 //
 // Mirrors the TypeScript WebSearch tool behaviour:
 // - Accepts a query string
 // - Returns a list of results with title, url, and snippet
-// - Falls back to DuckDuckGo if no search API key is configured
+// - SearXNG is tried first if SEARXNG_API_URL is configured
+// - Falls back to Brave Search API if BRAVE_SEARCH_API_KEY is set
+// - Falls back to DuckDuckGo if no API keys are configured
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -67,12 +69,21 @@ impl Tool for WebSearchTool {
         let num_results = params.num_results.min(10).max(1);
         debug!(query = %params.query, num_results, "Web search");
 
-        // Try Brave Search API first, then fall back to DuckDuckGo
-        if let Some(api_key) = std::env::var("BRAVE_SEARCH_API_KEY").ok().filter(|k| !k.is_empty()) {
-            search_brave(&params.query, num_results, &api_key).await
-        } else {
-            search_duckduckgo(&params.query, num_results).await
+        // Try SearXNG first if configured (e.g., http://localhost:8888)
+        if let Some(searxng_url) = std::env::var("SEARXNG_API_URL").ok().filter(|u| !u.is_empty()) {
+            match search_searxng(&params.query, num_results, &searxng_url).await {
+                Ok(results) => return results,
+                Err(e) => debug!("SearXNG search failed: {}, trying other providers", e),
+            }
         }
+
+        // Try Brave Search API next
+        if let Some(api_key) = std::env::var("BRAVE_SEARCH_API_KEY").ok().filter(|k| !k.is_empty()) {
+            return search_brave(&params.query, num_results, &api_key).await;
+        }
+
+        // Fall back to DuckDuckGo
+        search_duckduckgo(&params.query, num_results).await
     }
 }
 
@@ -124,6 +135,68 @@ fn format_brave_results(data: &Value, max: usize) -> String {
             let snippet = item.get("description").and_then(|s| s.as_str()).unwrap_or("");
 
             output.push_str(&format!("{}. **{}**\n   URL: {}\n   {}\n\n", i + 1, title, url, snippet));
+        }
+    }
+
+    if output.is_empty() {
+        "No results found.".to_string()
+    } else {
+        output
+    }
+}
+
+/// Search using a self-hosted SearXNG instance.
+///
+/// Set `SEARXNG_API_URL` to your SearXNG endpoint, e.g.:
+///   - http://localhost:8888  (local Docker)
+///   - http://host.docker.internal:8888  (Docker on macOS)
+async fn search_searxng(query: &str, num_results: usize, base_url: &str) -> Result<ToolResult, String> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/search?q={}&format=json&engines=google,bing,duckduckgo&safesearch=1&limit={}",
+        base_url.trim_end_matches('/'),
+        urlencoding_simple(query),
+        num_results
+    );
+
+    let resp = match client
+        .get(&url)
+        .header("User-Agent", "Claurst/1.0")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Err(format!("SearXNG request failed: {}", e)),
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        return Err(format!("SearXNG returned status {}", status));
+    }
+
+    let data: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return Err(format!("Failed to parse SearXNG response: {}", e)),
+    };
+
+    let results = format_searxng_results(&data, num_results);
+    Ok(ToolResult::success(results))
+}
+
+fn format_searxng_results(data: &Value, max: usize) -> String {
+    let mut output = String::new();
+    let results = data
+        .get("results")
+        .and_then(|r| r.as_array());
+
+    if let Some(items) = results {
+        for (i, item) in items.iter().take(max).enumerate() {
+            let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("(No title)");
+            let url = item.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let content = item.get("content").and_then(|c| c.as_str()).unwrap_or("");
+
+            output.push_str(&format!("{}. **{}**\n   URL: {}\n   {}\n\n", i + 1, title, url, content));
         }
     }
 

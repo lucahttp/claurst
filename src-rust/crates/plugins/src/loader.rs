@@ -74,6 +74,7 @@ pub async fn discover_plugins(
 ///
 /// `path` can be:
 /// - A directory containing `plugin.json` or `plugin.toml`
+/// - A directory containing `.claude-plugin/plugin.json` (Claude Code format)
 /// - A direct `plugin.json` or `plugin.toml` file
 ///
 /// Returns `Ok(None)` if the path does not look like a plugin (no manifest
@@ -92,8 +93,14 @@ pub fn try_load_from_path(
         } else if toml_path.exists() {
             (path.to_path_buf(), toml_path)
         } else {
-            // Directory with no manifest — not a plugin, skip silently.
-            return Ok(None);
+            // Check for Claude Code format: .claude-plugin/plugin.json
+            let cc_json_path = path.join(".claude-plugin").join("plugin.json");
+            if cc_json_path.exists() {
+                (path.to_path_buf(), cc_json_path)
+            } else {
+                // Directory with no manifest — not a plugin, skip silently.
+                return Ok(None);
+            }
         }
     } else if path.is_file() {
         // Accept a bare manifest file.
@@ -110,33 +117,52 @@ pub fn try_load_from_path(
 
     let manifest = load_manifest(&manifest_path)?;
 
-    // Resolve sub-paths.
+    // Check if this is Claude Code format (manifest is inside .claude-plugin/)
+    let is_claude_code_format = manifest_path
+        .parent()
+        .map(|p| p.file_name().map(|n| n == ".claude-plugin").unwrap_or(false))
+        .unwrap_or(false);
+
+    // For Claude Code format, the content dirs are at repo root, not inside .claude-plugin/
+    // The manifest_path is <repo>/.claude-plugin/plugin.json
+    // We need to set plugin_dir to the REPO root, not the .claude-plugin/ dir
+    let plugin_root = if is_claude_code_format {
+        manifest_path
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(&plugin_dir)
+            .to_path_buf()
+    } else {
+        plugin_dir.clone()
+    };
+
+    // Resolve sub-paths from plugin root.
     let commands_path = {
-        let p = plugin_dir.join("commands");
+        let p = plugin_root.join("commands");
         if p.is_dir() { Some(p) } else { None }
     };
     let agents_path = {
-        let p = plugin_dir.join("agents");
+        let p = plugin_root.join("agents");
         if p.is_dir() { Some(p) } else { None }
     };
     let skills_path = {
-        let p = plugin_dir.join("skills");
+        let p = plugin_root.join("skills");
         if p.is_dir() { Some(p) } else { None }
     };
     let output_styles_path = {
-        let p = plugin_dir.join("output-styles");
+        let p = plugin_root.join("output-styles");
         if p.is_dir() { Some(p) } else { None }
     };
 
     // Load hooks config (hooks/hooks.json takes priority over inline manifest field).
-    let hooks_config = load_hooks_config(&plugin_dir, &manifest);
+    let hooks_config = load_hooks_config(&plugin_root, &manifest);
 
     let plugin_name = manifest.name.clone();
     let plugin_source_id = format!("{}@{}", plugin_name, source.label());
 
     Ok(Some(LoadedPlugin {
         name: plugin_name,
-        path: plugin_dir,
+        path: plugin_root,
         source: source.clone(),
         source_id: plugin_source_id,
         manifest,
