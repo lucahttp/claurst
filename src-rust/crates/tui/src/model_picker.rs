@@ -90,15 +90,31 @@ impl Default for EffortLevel {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` for models that support extended thinking / effort levels.
+///
+/// Covers Claude's extended-thinking models and the GPT-5 reasoning family
+/// (incl. Codex / ChatGPT models like `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`),
+/// which honour OpenAI's `reasoning_effort` ladder. Lets the picker surface the
+/// ←/→ thinking-level selector for Codex the way opencode does.
 pub fn model_supports_effort(id: &str) -> bool {
     id.starts_with("claude-3-7")
         || id.starts_with("claude-opus-4")
         || id.starts_with("claude-sonnet-4")
+        || is_gpt5_reasoning_model(id)
 }
 
 /// Returns `true` for models that support the maximum effort tier.
+///
+/// For Claude this is Opus-only; for the GPT-5 family the top tier maps to
+/// OpenAI's `xhigh` ("extra high") reasoning effort on the Codex endpoint.
 pub fn model_supports_max_effort(id: &str) -> bool {
-    id.starts_with("claude-opus-4")
+    id.starts_with("claude-opus-4") || is_gpt5_reasoning_model(id)
+}
+
+/// Whether `id` is a GPT-5 reasoning model (`gpt-5*`), excluding the
+/// non-reasoning chat / pro snapshots that ignore `reasoning_effort`.
+fn is_gpt5_reasoning_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    id.starts_with("gpt-5") && !id.contains("-chat") && !id.contains("-pro")
 }
 
 /// Returns a short description string based on the model family inferred from
@@ -263,9 +279,12 @@ pub fn models_for_provider_from_registry(
         return free_provider_models();
     }
     // Codex (ChatGPT-authenticated OpenAI) is not in the models.dev catalog —
-    // serve the curated CODEX_MODELS list so the picker isn't empty.
-    if provider_id == "codex" {
-        return codex_provider_models();
+    // serve the curated CODEX_MODELS list so the picker isn't empty.  Accept
+    // both the canonical id ("codex") and the connect-dialog alias
+    // ("openai-codex"); without the alias a fresh Codex login lands on the
+    // empty-registry fallback and the picker shows no models.
+    if is_codex_provider(provider_id) {
+        return codex_provider_models(registry);
     }
 
     let mut entries = registry.list_visible_by_provider(provider_id);
@@ -332,6 +351,16 @@ pub fn default_model_for_provider(
     if provider_id == "free" {
         return "free/auto".to_string();
     }
+    // Codex endpoints are not catalogued by models.dev, so the registry can
+    // never supply a default for them — pin the curated flagship Codex model,
+    // preserving whichever id alias ("codex" / "openai-codex") the caller used.
+    if is_codex_provider(provider_id) {
+        return format!(
+            "{}/{}",
+            provider_id,
+            claurst_core::codex_oauth::DEFAULT_CODEX_MODEL
+        );
+    }
     if let Some(best) = registry.best_model_for_provider(provider_id) {
         if provider_id == "anthropic" {
             best
@@ -343,22 +372,85 @@ pub fn default_model_for_provider(
     }
 }
 
-/// Curated Codex (ChatGPT-authenticated OpenAI) model list used by
-/// `models_for_provider_from_registry` because models.dev does not catalog
-/// these endpoints.
-fn codex_provider_models() -> Vec<ModelEntry> {
+/// Whether `provider_id` refers to the OpenAI Codex provider under either of
+/// its two id spellings: the canonical `"codex"` (used by `CodexProvider`,
+/// the model registry, and the runtime dispatch) or the `"openai-codex"`
+/// alias emitted by the /connect dialog's Codex entry. Both must resolve to
+/// the curated Codex catalog since models.dev does not list these endpoints.
+fn is_codex_provider(provider_id: &str) -> bool {
+    matches!(provider_id, "codex" | "openai-codex")
+}
+
+/// Codex (ChatGPT-authenticated OpenAI) model list.
+///
+/// Mirrors opencode's `provider.models()` hook exactly: instead of hardcoding a
+/// list, it takes the models.dev `openai` catalog and keeps only the ids that
+/// [`codex_model_allowed`] admits (gpt-5.5 / gpt-5.4 / gpt-5.4-mini /
+/// gpt-5.3-codex-spark today, plus any future gpt-5.5+). Costs are zeroed
+/// (subscription billing) and the gpt-5.5 context window is pinned to the Codex
+/// 400K limit. Falls back to the curated [`CODEX_MODELS`] constant only if the
+/// catalog yields nothing (e.g. an empty/old snapshot).
+///
+/// [`codex_model_allowed`]: claurst_core::codex_oauth::codex_model_allowed
+fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntry> {
+    use claurst_core::codex_oauth::{codex_limit_override, codex_model_allowed};
+
+    let mut entries: Vec<&claurst_api::ModelEntry> = registry
+        .list_by_provider("openai")
+        .into_iter()
+        .filter(|e| codex_model_allowed(&e.info.id))
+        .collect();
+
+    if entries.is_empty() {
+        return codex_fallback_models();
+    }
+
+    // Newest release first, then by id for stability — matches the picker's
+    // ordering for other providers.
+    entries.sort_by(|a, b| {
+        let rd_a = a.release_date.as_deref().unwrap_or("");
+        let rd_b = b.release_date.as_deref().unwrap_or("");
+        rd_b.cmp(rd_a).then_with(|| (*a.info.id).cmp(&*b.info.id))
+    });
+
+    entries
+        .iter()
+        .map(|e| {
+            let id: &str = &e.info.id;
+            let ctx = codex_limit_override(id)
+                .map(|(context, _, _)| context)
+                .unwrap_or(e.info.context_window);
+            ModelEntry {
+                id: id.to_string(),
+                display_name: e.info.name.clone(),
+                // Costs are zeroed under the ChatGPT subscription, so advertise
+                // "free" rather than the catalog's pay-as-you-go pricing.
+                description: format!(
+                    "{} | ChatGPT-authenticated · free",
+                    format_context_window(ctx)
+                ),
+                is_current: false,
+            }
+        })
+        .collect()
+}
+
+/// Static fallback used when the models.dev `openai` catalog is unavailable.
+fn codex_fallback_models() -> Vec<ModelEntry> {
+    use claurst_core::codex_oauth::codex_limit_override;
     claurst_core::codex_oauth::CODEX_MODELS
         .iter()
         .map(|(id, name)| {
-            let ctx = match *id {
-                "gpt-5.4" | "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.1-codex"
-                | "gpt-5.1-codex-mini" | "gpt-5.1-codex-max" => "400K ctx",
-                _ => "128K ctx",
-            };
+            let ctx = codex_limit_override(id)
+                .map(|(context, _, _)| context)
+                .unwrap_or(400_000);
             ModelEntry {
                 id: id.to_string(),
                 display_name: name.to_string(),
-                description: format!("{} | ChatGPT-authenticated", ctx),
+                description: format!(
+                    "{} | ChatGPT-authenticated · free",
+                    format_context_window(ctx)
+                ),
                 is_current: false,
             }
         })
@@ -1086,6 +1178,20 @@ mod tests {
         assert!(!model_supports_max_effort("claude-haiku-4-5"));
     }
 
+    // 12b. GPT-5 codex/reasoning models expose the effort selector (incl. max).
+    #[test]
+    fn gpt5_codex_models_support_effort() {
+        for id in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
+            assert!(model_supports_effort(id), "{id} should support effort");
+            assert!(model_supports_max_effort(id), "{id} should support max/xhigh");
+        }
+        // Non-reasoning chat / pro snapshots are excluded.
+        assert!(!model_supports_effort("gpt-5-chat-latest"));
+        assert!(!model_supports_effort("gpt-5.5-pro"));
+        // Non-gpt5 stays unaffected.
+        assert!(!model_supports_effort("gpt-4o"));
+    }
+
     // 13. Non-effort models return None from effective_effort.
     #[test]
     fn haiku_has_no_effort() {
@@ -1145,6 +1251,47 @@ mod tests {
             models.iter().any(|m| m.id.starts_with("gpt-") || m.id.starts_with("o3") || m.id.starts_with("o4")),
             "openai should expose at least one gpt/o-series model"
         );
+    }
+
+    // Codex login lands on the "openai-codex" provider id (the /connect alias).
+    // Both that alias and the canonical "codex" must yield the curated Codex
+    // catalog — never the empty-registry "default" placeholder.
+    #[test]
+    fn models_for_provider_codex_aliases() {
+        let registry = claurst_api::ModelRegistry::new();
+        for pid in ["codex", "openai-codex"] {
+            let models = models_for_provider_from_registry(pid, &registry);
+            assert!(!models.is_empty(), "{pid} must yield Codex models");
+            assert_ne!(models[0].id, "default", "{pid} must not fall back to default");
+
+            let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+            // Opencode's exact allow-list (from the current snapshot).
+            assert!(ids.contains(&"gpt-5.5"), "{pid} must list gpt-5.5: {ids:?}");
+            assert!(ids.contains(&"gpt-5.4"), "{pid} must list gpt-5.4: {ids:?}");
+            assert!(ids.contains(&"gpt-5.4-mini"), "{pid} must list gpt-5.4-mini: {ids:?}");
+            // gpt-5.5 is the newest -> sorts first -> is the default highlight.
+            assert_eq!(models[0].id, "gpt-5.5", "{pid} newest model should sort first");
+            // Legacy / disallowed models must be gone.
+            for legacy in ["gpt-5.5-pro", "gpt-5.2-codex", "gpt-5.1-codex", "gpt-5.4-nano", "gpt-5"] {
+                assert!(!ids.contains(&legacy), "{pid} must not list {legacy}: {ids:?}");
+            }
+        }
+    }
+
+    // default_model_for_provider must pin a real Codex flagship (not
+    // "<id>/default") for both id spellings, preserving the caller's prefix.
+    #[test]
+    fn default_model_for_provider_codex_aliases() {
+        let registry = claurst_api::ModelRegistry::new();
+        for pid in ["codex", "openai-codex"] {
+            let m = default_model_for_provider(pid, &registry);
+            assert_eq!(
+                m,
+                format!("{}/{}", pid, claurst_core::codex_oauth::DEFAULT_CODEX_MODEL),
+                "{pid} default must pin the curated flagship Codex model"
+            );
+            assert!(!m.ends_with("/default"), "{pid} must not fall back to /default");
+        }
     }
 
     #[test]
