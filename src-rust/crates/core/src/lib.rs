@@ -82,7 +82,7 @@ pub use types::{
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
 pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
-pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
+pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result, load_env_from_claude_settings};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
@@ -682,7 +682,7 @@ pub mod config {
             "siliconflow" => &["SILICONFLOW_API_KEY"],
             "nebius" => &["NEBIUS_API_KEY"],
             "novita" => &["NOVITA_API_KEY"],
-            "minimax" => &["MINIMAX_API_KEY"],
+            "minimax" => &["MINIMAX_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
             "ovhcloud" => &["OVHCLOUD_API_KEY"],
             "scaleway" => &["SCALEWAY_API_KEY"],
             "vultr" | "vultr-ai" => &["VULTR_API_KEY"],

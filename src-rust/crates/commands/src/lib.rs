@@ -2040,7 +2040,7 @@ impl SlashCommand for PluginCommand {
                 )
             }
             claurst_plugins::PluginSubCommand::Marketplace(query) => {
-                let result = claurst_plugins::install_plugin_from_marketplace(query).await;
+                let result = claurst_plugins::install_plugin_from_marketplace(&query).await;
                 match result {
                     Ok(name) => CommandResult::Message(format!(
                         "Plugin '{}' installed successfully. Run `/plugin reload` to activate it.",

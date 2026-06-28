@@ -352,9 +352,11 @@ fn try_unzip_flat(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
     let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
 
     // First, check if the zip extracts to a single subdirectory
-    let first_entry = zip.by_index(0).map_err(|e| e.to_string())?;
-    let first_name = first_entry.name().to_string();
-    let has_subdir = first_name.contains('/') && !first_name.ends_with('/');
+    let has_subdir = {
+        let first_entry = zip.by_index(0).map_err(|e| e.to_string())?;
+        let first_name = first_entry.name().to_string();
+        first_name.contains('/') && !first_name.ends_with('/')
+    }; // first_entry is dropped here, releasing the borrow on zip
 
     if has_subdir {
         // GitHub archive style: extracts to `repo-branch/`

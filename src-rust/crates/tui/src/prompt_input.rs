@@ -1599,17 +1599,24 @@ impl PromptInputState {
     /// submission.  Does NOT modify `paste_contents` — use `clear_paste_contents`
     /// after successful message send.
     pub fn get_resolved_text(&self) -> String {
-        let mut result = self.text.clone();
+        let text = self.text.clone();
         // Pattern: [Pasted ~<N> lines #<M>]
         // Group 1 = line count, Group 2 = paste_id (key into paste_contents).
         let pattern = regex::Regex::new(r"\[Pasted ~(\d+) lines #(\d+)\]").unwrap();
 
-        for cap in pattern.captures_iter(&result) {
-            if let Ok(paste_id) = cap[2].parse::<u32>() {
-                if let Some(content) = self.paste_contents.get(&paste_id) {
-                    result = result.replace(&cap[0], content);
-                }
-            }
+        // Collect replacements first to avoid borrow conflict
+        let replacements: Vec<(String, String)> = pattern
+            .captures_iter(&text)
+            .filter_map(|cap| {
+                let paste_id = cap[2].parse::<u32>().ok()?;
+                let content = self.paste_contents.get(&paste_id)?;
+                Some((cap[0].to_string(), content.clone()))
+            })
+            .collect();
+
+        let mut result = text;
+        for (from, to) in replacements {
+            result = result.replace(&from, &to);
         }
 
         result

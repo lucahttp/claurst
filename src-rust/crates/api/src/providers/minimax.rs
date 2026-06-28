@@ -30,7 +30,9 @@ pub struct MinimaxProvider {
 
 impl MinimaxProvider {
     pub fn new(api_key: String) -> Self {
+        // Check MINIMAX_BASE_URL first (claurst native), then ANTHROPIC_BASE_URL (Claude Code compat)
         let api_base = std::env::var("MINIMAX_BASE_URL")
+            .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
             .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
         let mut headers = header::HeaderMap::new();
         headers.insert("X-Api-Key", header::HeaderValue::from_str(&api_key).expect("unable to parse api key for http header"));
@@ -101,100 +103,218 @@ impl MinimaxProvider {
         }
     }
 
-    fn map_anthropic_event(value: Value) -> Option<StreamEvent> {
-        let event_type = value.get("type")?.as_str()?;
+    /// Map an Anthropic-style SSE event to one or more StreamEvents.
+    /// Returns a Vec because a complete non-streaming "message" event needs to be
+    /// converted into multiple streaming events to simulate the stream.
+    fn map_anthropic_event(value: Value) -> Vec<StreamEvent> {
+        let event_type = match value.get("type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
 
         match event_type {
             "message_start" => {
-                let id = value.get("message")?.get("id")?.as_str()?.to_string();
-                let model = value.get("message")?.get("model")?.as_str()?.to_string();
+                let id = match value.get("message").and_then(|m| m.get("id")).and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => return Vec::new(),
+                };
+                let model = match value.get("message").and_then(|m| m.get("model")).and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => return Vec::new(),
+                };
                 let usage = UsageInfo {
-                    input_tokens: value.get("message")?.get("usage")?.get("input_tokens")?.as_u64()?,
+                    input_tokens: value.get("message").and_then(|m| m.get("usage")).and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64()).unwrap_or(0),
                     output_tokens: 0,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
                 };
-                Some(StreamEvent::MessageStart { id, model, usage })
+                vec![StreamEvent::MessageStart { id, model, usage }]
             }
             "content_block_start" => {
-                let index = value.get("index")?.as_u64()? as usize;
-                let content_type = value.get("content_block")?.get("type")?.as_str()?;
+                let index = match value.get("index").and_then(|v| v.as_u64()) {
+                    Some(i) => i as usize,
+                    None => return Vec::new(),
+                };
+                let content_type = match value.get("content_block").and_then(|c| c.get("type")).and_then(|v| v.as_str()) {
+                    Some(t) => t,
+                    None => return Vec::new(),
+                };
 
                 let content_block = match content_type {
                     "text" => ContentBlock::Text {
                         text: String::new(),
                     },
                     "tool_use" => {
-                        let id = value.get("content_block")?.get("id")?.as_str()?.to_string();
-                        let name = value.get("content_block")?.get("name")?.as_str()?.to_string();
+                        let id = match value.get("content_block").and_then(|c| c.get("id")).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => return Vec::new(),
+                        };
+                        let name = match value.get("content_block").and_then(|c| c.get("name")).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => return Vec::new(),
+                        };
                         ContentBlock::ToolUse {
                             id,
                             name,
                             input: serde_json::Value::Object(Default::default()),
                         }
                     }
-                    _ => return None,
+                    _ => return Vec::new(),
                 };
 
-                Some(StreamEvent::ContentBlockStart { index, content_block })
+                vec![StreamEvent::ContentBlockStart { index, content_block }]
             }
             "content_block_delta" => {
-                let index = value.get("index")?.as_u64()? as usize;
-                let delta_type = value.get("delta")?.get("type")?.as_str()?;
+                let index = match value.get("index").and_then(|v| v.as_u64()) {
+                    Some(i) => i as usize,
+                    None => return Vec::new(),
+                };
+                let delta_type = match value.get("delta").and_then(|d| d.get("type")).and_then(|v| v.as_str()) {
+                    Some(t) => t,
+                    None => return Vec::new(),
+                };
 
                 match delta_type {
                     "text_delta" => {
-                        let text = value.get("delta")?.get("text")?.as_str()?.to_string();
-                        Some(StreamEvent::TextDelta { index, text })
+                        let text = match value.get("delta").and_then(|d| d.get("text")).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => return Vec::new(),
+                        };
+                        vec![StreamEvent::TextDelta { index, text }]
                     }
                     "thinking_delta" => {
-                        let thinking = value.get("delta")?.get("thinking")?.as_str()?.to_string();
-                        Some(StreamEvent::ThinkingDelta { index, thinking })
+                        let thinking = match value.get("delta").and_then(|d| d.get("thinking")).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => return Vec::new(),
+                        };
+                        vec![StreamEvent::ThinkingDelta { index, thinking }]
                     }
                     "signature_delta" => {
-                        let signature = value.get("delta")?.get("signature")?.as_str()?.to_string();
-                        Some(StreamEvent::SignatureDelta { index, signature })
+                        let signature = match value.get("delta").and_then(|d| d.get("signature")).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => return Vec::new(),
+                        };
+                        vec![StreamEvent::SignatureDelta { index, signature }]
                     }
                     "input_json_delta" => {
-                        let partial_json = value.get("delta")?.get("partial_json")?.as_str()?.to_string();
-                        Some(StreamEvent::InputJsonDelta { index, partial_json })
+                        let partial_json = match value.get("delta").and_then(|d| d.get("partial_json")).and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => return Vec::new(),
+                        };
+                        vec![StreamEvent::InputJsonDelta { index, partial_json }]
                     }
-                    _ => None,
+                    _ => Vec::new(),
                 }
             }
             "content_block_stop" => {
-                let index = value.get("index")?.as_u64()? as usize;
-                Some(StreamEvent::ContentBlockStop { index })
+                let index = match value.get("index").and_then(|v| v.as_u64()) {
+                    Some(i) => i as usize,
+                    None => return Vec::new(),
+                };
+                vec![StreamEvent::ContentBlockStop { index }]
             }
             "message_delta" => {
-                let stop_reason = value.get("delta")?
-                    .get("stop_reason")?
-                    .as_str()
+                let stop_reason = value.get("delta")
+                    .and_then(|d| d.get("stop_reason"))
+                    .and_then(|v| v.as_str())
                     .map(Self::map_stop_reason);
 
-                let usage = value.get("delta")?.get("usage")
-                    .and_then(|u| {
-                        Some(UsageInfo {
-                            input_tokens: u.get("input_tokens")?.as_u64()?,
-                            output_tokens: u.get("output_tokens")?.as_u64()?,
-                            cache_creation_input_tokens: u.get("cache_creation_input_tokens")?.as_u64().unwrap_or(0),
-                            cache_read_input_tokens: u.get("cache_read_input_tokens")?.as_u64().unwrap_or(0),
-                        })
+                let usage = value.get("delta").and_then(|u| u.get("usage"))
+                    .map(|u| UsageInfo {
+                        input_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        output_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        cache_creation_input_tokens: u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        cache_read_input_tokens: u.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                     });
 
-                Some(StreamEvent::MessageDelta {
+                vec![StreamEvent::MessageDelta {
                     stop_reason,
                     usage,
-                })
+                }]
             }
-            "message_stop" => Some(StreamEvent::MessageStop),
+            "message_stop" => vec![StreamEvent::MessageStop],
             "error" => {
-                let error_type = value.get("error")?.get("type")?.as_str()?.to_string();
-                let message = value.get("error")?.get("message")?.as_str()?.to_string();
-                Some(StreamEvent::Error { error_type, message })
+                let error_type = match value.get("error").and_then(|e| e.get("type")).and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => return Vec::new(),
+                };
+                let message = match value.get("error").and_then(|e| e.get("message")).and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => return Vec::new(),
+                };
+                vec![StreamEvent::Error { error_type, message }]
             }
-            "ping" => None,
-            _ => None,
+            "ping" => Vec::new(),
+            // Handle non-streaming "message" event type by expanding into multiple stream events
+            "message" => {
+                let mut events = Vec::new();
+
+                // MessageStart
+                let id = match value.get("id").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => return Vec::new(),
+                };
+                let model = match value.get("model").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => return Vec::new(),
+                };
+                let usage = UsageInfo {
+                    input_tokens: value.get("usage").and_then(|u| u.get("input_tokens")).and_then(|v| v.as_u64()).unwrap_or(0),
+                    output_tokens: value.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_u64()).unwrap_or(0),
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: value.get("usage").and_then(|u| u.get("cache_read_input_tokens")).and_then(|v| v.as_u64()).unwrap_or(0),
+                };
+                events.push(StreamEvent::MessageStart { id, model, usage: usage.clone() });
+
+                // Content blocks
+                if let Some(content) = value.get("content").and_then(|c| c.as_array()) {
+                    for (index, block) in content.iter().enumerate() {
+                        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("text");
+
+                        // ContentBlockStart
+                        let content_block = match block_type {
+                            "text" => ContentBlock::Text { text: String::new() },
+                            "tool_use" => {
+                                let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                ContentBlock::ToolUse {
+                                    id,
+                                    name,
+                                    input: block.get("input").cloned().unwrap_or(serde_json::Value::Object(Default::default())),
+                                }
+                            }
+                            _ => ContentBlock::Text { text: String::new() },
+                        };
+                        events.push(StreamEvent::ContentBlockStart { index, content_block });
+
+                        // ContentBlockDelta for text
+                        if block_type == "text" {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                events.push(StreamEvent::TextDelta { index, text: text.to_string() });
+                            }
+                        }
+
+                        // ContentBlockStop
+                        events.push(StreamEvent::ContentBlockStop { index });
+                    }
+                }
+
+                // MessageDelta with stop_reason
+                let stop_reason = value.get("stop_reason")
+                    .and_then(|v| v.as_str())
+                    .map(Self::map_stop_reason);
+
+                events.push(StreamEvent::MessageDelta {
+                    stop_reason,
+                    usage: Some(usage),
+                });
+
+                // MessageStop
+                events.push(StreamEvent::MessageStop);
+
+                events
+            }
+            _ => Vec::new(),
         }
     }
 }
@@ -346,7 +466,7 @@ impl LlmProvider for MinimaxProvider {
 
         let resp = http_client
             .post(&url)
-            .header("Authorization", api_key)
+            .header("Authorization", format!("Bearer {}", api_key))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
@@ -375,6 +495,7 @@ impl LlmProvider for MinimaxProvider {
         let s = stream! {
             let byte_stream = resp.bytes_stream();
             let mut leftover = String::new();
+            let mut current_event_type: Option<String> = None;
 
             use futures::StreamExt;
             let mut stream = std::pin::pin!(byte_stream);
@@ -402,15 +523,37 @@ impl LlmProvider for MinimaxProvider {
                                 continue;
                             }
 
+                            // Handle SSE "event:" prefix (MiniMax format)
+                            if let Some(event_type) = line.strip_prefix("event:") {
+                                current_event_type = Some(event_type.trim().to_string());
+                                continue;
+                            }
+
+                            // Handle SSE "data:" prefix
                             let data = if let Some(rest) = line.strip_prefix("data:") {
                                 rest.trim()
                             } else {
+                                // Try to parse raw JSON (non-streaming fallback)
                                 line
                             };
 
                             match serde_json::from_str::<Value>(data) {
                                 Ok(value) => {
-                                    if let Some(stream_evt) = Self::map_anthropic_event(value) {
+                                    // If we have a stored event type from "event:" line,
+                                    // inject it into the JSON if not already present
+                                    let value_with_type = if let Some(evt_type) = current_event_type.take() {
+                                        if value.get("type").is_none() {
+                                            let mut obj = value.as_object().unwrap().clone();
+                                            obj.insert("type".to_string(), serde_json::Value::String(evt_type));
+                                            serde_json::Value::Object(obj)
+                                        } else {
+                                            value
+                                        }
+                                    } else {
+                                        value
+                                    };
+
+                                    for stream_evt in Self::map_anthropic_event(value_with_type) {
                                         yield Ok(stream_evt);
                                     }
                                 }

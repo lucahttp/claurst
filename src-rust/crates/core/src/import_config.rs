@@ -43,6 +43,45 @@ impl ImportPaths {
     }
 }
 
+/// Load environment variables from `~/.claude/settings.json`'s `env` section
+/// and set them as actual process environment variables.
+///
+/// This allows claurst to share configuration with Claude Code, which stores
+/// provider API keys and other env vars in the `env` section of its settings.
+///
+/// Only keys that are NOT already set in the process environment will be set,
+/// giving priority to explicitly configured env vars.
+pub fn load_env_from_claude_settings() {
+    let claude_settings_path = dirs::home_dir()
+        .map(|h| h.join(".claude").join("settings.json"))
+        .filter(|p| p.exists());
+
+    let Some(path) = claude_settings_path else {
+        return;
+    };
+
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return;
+    };
+
+    let Some(env_obj) = value.get("env").and_then(|v| v.as_object()) else {
+        return;
+    };
+
+    for (key, val) in env_obj {
+        // Only set if not already present - explicit env vars take precedence
+        if let Some(val_str) = val.as_str() {
+            if std::env::var(key).is_err() {
+                std::env::set_var(key, val_str);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilePlan {
     pub source_path: PathBuf,

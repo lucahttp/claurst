@@ -365,6 +365,11 @@ fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEv
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load env vars from ~/.claude/settings.json (if exists) so they are available
+    // when provider configs are resolved. This allows claurst to share the same
+    // configuration as Claude Code.
+    claurst_core::load_env_from_claude_settings();
+
     // Fast-path: handle --version before parsing everything
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.iter().any(|a| a == "--version" || a == "-V") {
