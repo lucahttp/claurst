@@ -13,6 +13,15 @@ pub mod marketplace;
 pub mod plugin;
 pub mod registry;
 
+// Re-export marketplace types
+pub use marketplace::{
+    add_marketplace_source, install_plugin_from_marketplace, list_marketplaces,
+    marketplace_search, marketplace_install, marketplace_uninstall, marketplace_update,
+    marketplace_check_updates_all, parse_plugin_identifier, remove_marketplace,
+    search_marketplaces, KnownMarketplace, MarketplaceError, MarketplaceManifest,
+    MarketplaceSource, PluginMarketplaceEntry, PluginSourceVariant,
+};
+
 // Re-export the most commonly used items at the crate root.
 pub use hooks::{HookOutcome, HookRegistry, RegisteredHook, register_plugin_hooks};
 pub use loader::{default_user_plugins_dir, discover_plugins, project_plugins_dir};
@@ -265,7 +274,15 @@ pub enum PluginSubCommand {
     Info(String),
     /// `/plugin install <path>` — install a plugin from a local path.
     Install(String),
-    /// `/plugin marketplace <query>` — search or install from the marketplace.
+    /// `/plugin marketplace add <source>` — add a marketplace by GitHub shorthand, URL, or path.
+    MarketplaceAdd(String),
+    /// `/plugin marketplace list` — list known marketplaces.
+    MarketplaceList,
+    /// `/plugin marketplace search <query>` — search plugins across all marketplaces.
+    MarketplaceSearch(String),
+    /// `/plugin marketplace remove <name>` — remove a cached marketplace.
+    MarketplaceRemove(String),
+    /// `/plugin marketplace <name>` — install a plugin from a marketplace (shorthand).
     Marketplace(String),
     /// `/plugin reload` — reload plugins from disk.
     Reload,
@@ -280,7 +297,7 @@ pub fn parse_plugin_args(args: &str) -> PluginSubCommand {
     if args.is_empty() {
         return PluginSubCommand::List;
     }
-    let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
+    let parts: Vec<&str> = args.splitn(4, char::is_whitespace).collect();
     match parts.first().map(|s| s.to_lowercase()).as_deref() {
         Some("list") | Some("ls") => PluginSubCommand::List,
         Some("enable") => PluginSubCommand::Enable(
@@ -295,7 +312,28 @@ pub fn parse_plugin_args(args: &str) -> PluginSubCommand {
         Some("install") | Some("i") => PluginSubCommand::Install(
             parts.get(1).unwrap_or(&"").to_string(),
         ),
-        Some("marketplace") | Some("add") | Some("search") => PluginSubCommand::Marketplace(
+        Some("marketplace") => {
+            let subcmd = parts.get(1).map(|s| s.to_lowercase()).as_deref();
+            match subcmd {
+                Some("add") => PluginSubCommand::MarketplaceAdd(
+                    parts.get(2).unwrap_or(&"").to_string(),
+                ),
+                Some("list") | Some("ls") => PluginSubCommand::MarketplaceList,
+                Some("search") => PluginSubCommand::MarketplaceSearch(
+                    parts.get(2).unwrap_or(&"").to_string(),
+                ),
+                Some("remove") | Some("rm") | Some("delete") => PluginSubCommand::MarketplaceRemove(
+                    parts.get(2).unwrap_or(&"").to_string(),
+                ),
+                _ => PluginSubCommand::Marketplace(
+                    parts.get(1).unwrap_or(&"").to_string(),
+                ),
+            }
+        }
+        Some("add") => PluginSubCommand::MarketplaceAdd(
+            parts.get(1).unwrap_or(&"").to_string(),
+        ),
+        Some("search") => PluginSubCommand::MarketplaceSearch(
             parts.get(1).unwrap_or(&"").to_string(),
         ),
         Some("reload") | Some("refresh") => PluginSubCommand::Reload,

@@ -47,6 +47,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
 
+# Time
+chrono = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }

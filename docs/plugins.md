@@ -340,13 +340,18 @@ When a blocking hook exits non-zero, Claurst denies the operation and reports th
 The `/plugin` slash command manages plugins from within an interactive session:
 
 ```
-/plugin                      — list all installed plugins
-/plugin list                 — list all installed plugins with status
-/plugin info <name>          — show detailed info about a plugin
-/plugin enable <name>        — enable a plugin (persisted to settings)
-/plugin disable <name>       — disable a plugin (persisted to settings)
-/plugin install <path>       — install a plugin from a local directory
-/plugin reload               — reload all plugins from disk
+/plugin                              — list all installed plugins
+/plugin list                         — list all installed plugins with status
+/plugin info <name>                  — show detailed info about a plugin
+/plugin enable <name>               — enable a plugin (persisted to settings)
+/plugin disable <name>               — disable a plugin (persisted to settings)
+/plugin install <path>              — install a plugin from a local directory
+/plugin marketplace add <source>     — add a marketplace by GitHub shorthand, URL, or path
+/plugin marketplace list            — list cached marketplaces
+/plugin marketplace search <query>  — search plugins across marketplaces
+/plugin marketplace remove <name>   — remove a cached marketplace
+/plugin marketplace <plugin@marketplace> — install a plugin from a marketplace
+/plugin reload                     — reload all plugins from disk
 ```
 
 After enabling or disabling a plugin, run `/plugin reload` or use `/reload-plugins` to apply changes in the current session without restarting.
@@ -363,15 +368,47 @@ Rescans `~/.claurst/plugins/`, re-reads all manifests, and refreshes the active 
 
 ## Plugin Marketplace Integration
 
-Plugins published to the Claurst marketplace have a `marketplace_id` field in their manifest (e.g. `"author/plugin-name"`). The marketplace integration allows:
+Claurst supports GitHub-based plugin marketplaces. Add a marketplace by its GitHub shorthand, then install plugins from it.
 
-- Browsing available plugins
-- Installing plugins by ID
-- Updating installed plugins to newer versions
+### Marketplace Commands
 
 ```
-/plugin install author/plugin-name     — install from the marketplace
+/plugin marketplace add microsoft/power-platform-skills
+    — Add a marketplace from a GitHub repo (owner/repo or owner/repo@branch)
+
+/plugin marketplace add owner/repo@beta
+    — Add a specific branch
+
+/plugin marketplace add https://github.com/owner/repo
+    — Add from a full GitHub URL
+
+/plugin marketplace add ./path/to/marketplace
+    — Add from a local directory or marketplace.json file
+
+/plugin marketplace list
+    — List all cached marketplaces
+
+/plugin marketplace search <query>
+    — Search plugins across all cached marketplaces
+
+/plugin marketplace remove <name>
+    — Remove a cached marketplace
+
+/plugin marketplace owner/plugin-name
+    — Install a plugin from a marketplace (shorthand for owner/plugin-name@marketplace-name)
 ```
+
+### Installing Plugins
+
+```
+/plugin marketplace power-pages@microsoft-skills
+    — Install 'power-pages' from the 'microsoft-skills' marketplace
+
+/plugin install owner/plugin-name
+    — Install from GitHub directly (owner/repo format)
+```
+
+Plugins published to a marketplace have a `marketplace_id` field in their manifest (e.g. `"author/plugin-name"`). The marketplace manifest (`marketplace.json`) describes available plugins and their sources.
 
 Locally installed plugins (via a file path) do not require a `marketplace_id`.
 

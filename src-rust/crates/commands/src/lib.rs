@@ -2026,25 +2026,100 @@ impl SlashCommand for PluginCommand {
                     Err(e) => CommandResult::Error(format!("Install failed: {}", e)),
                 }
             }
+            claurst_plugins::PluginSubCommand::MarketplaceAdd(ref source) if source.is_empty() => {
+                CommandResult::Error(
+                    "Usage: /plugin marketplace add <source>\n\
+                     \n\
+                     Add a marketplace by source:\n\
+                       /plugin marketplace add microsoft/power-platform-skills\n\
+                       /plugin marketplace add owner/repo@branch\n\
+                       /plugin marketplace add https://github.com/owner/repo\n\
+                       /plugin marketplace add ./path/to/marketplace\n\
+                     \n\
+                     After adding, use /plugin marketplace list to see it."
+                        .to_string(),
+                )
+            }
+            claurst_plugins::PluginSubCommand::MarketplaceAdd(source) => {
+                let result = claurst_plugins::add_marketplace_source(&source, Default::default()).await;
+                match result {
+                    Ok((name, already_materialized)) => {
+                        if already_materialized {
+                            CommandResult::Message(format!("Marketplace '{}' already in cache.", name))
+                        } else {
+                            CommandResult::Message(format!("Marketplace '{}' added successfully.", name))
+                        }
+                    }
+                    Err(e) => CommandResult::Error(format!("Failed to add marketplace: {}", e)),
+                }
+            }
+            claurst_plugins::PluginSubCommand::MarketplaceList => {
+                let marketplaces = claurst_plugins::list_marketplaces();
+                if marketplaces.is_empty() {
+                    CommandResult::Message(
+                        "No marketplaces configured.\n\nAdd one with: /plugin marketplace add <source>".to_string(),
+                    )
+                } else {
+                    let lines: Vec<String> = marketplaces.iter().map(|m| {
+                        format!("  {} — {:?}", m.name, m.source)
+                    }).collect();
+                    CommandResult::Message(format!("Known marketplaces:\n{}", lines.join("\n")))
+                }
+            }
+            claurst_plugins::PluginSubCommand::MarketplaceSearch(ref query) if query.is_empty() => {
+                CommandResult::Error(
+                    "Usage: /plugin marketplace search <query>\n\
+                     Search plugins across all cached marketplaces.".to_string(),
+                )
+            }
+            claurst_plugins::PluginSubCommand::MarketplaceSearch(query) => {
+                let results = claurst_plugins::search_marketplaces(&query).await;
+                if results.is_empty() {
+                    CommandResult::Message(format!(
+                        "No plugins found matching '{}' in cached marketplaces.\n\
+                         Add more marketplaces with: /plugin marketplace add <source>",
+                        query
+                    ))
+                } else {
+                    let lines: Vec<String> = results.iter().take(20).map(|(mkt, plugin)| {
+                        format!("  {} @ {} — {}",
+                            plugin.name,
+                            mkt,
+                            plugin.description.as_deref().unwrap_or("")
+                        )
+                    }).collect();
+                    CommandResult::Message(format!("Search results:\n{}", lines.join("\n")))
+                }
+            }
+            claurst_plugins::PluginSubCommand::MarketplaceRemove(ref name) if name.is_empty() => {
+                CommandResult::Error(
+                    "Usage: /plugin marketplace remove <name>\n\
+                     Remove a cached marketplace.".to_string(),
+                )
+            }
+            claurst_plugins::PluginSubCommand::MarketplaceRemove(name) => {
+                match claurst_plugins::remove_marketplace(&name) {
+                    Ok(()) => CommandResult::Message(format!("Marketplace '{}' removed.", name)),
+                    Err(e) => CommandResult::Error(format!("Failed to remove marketplace: {}", e)),
+                }
+            }
             claurst_plugins::PluginSubCommand::Marketplace(ref query) if query.is_empty() => {
                 CommandResult::Error(
-                    "Usage: /plugin marketplace <name-or-repo>\n\
+                    "Usage: /plugin marketplace <plugin@marketplace>\n\
                      \n\
-                     Install a plugin from the marketplace or GitHub:\n\
-                       /plugin marketplace add microsoft/skills-for-copilot-studio\n\
-                       /plugin marketplace add owner/repo\n\
-                       /plugin marketplace add https://github.com/owner/repo\n\
+                     Install a plugin from a marketplace:\n\
+                       /plugin marketplace power-pages@microsoft-skills\n\
+                       /plugin marketplace owner/plugin-name\n\
                      \n\
-                     Run `/plugin list` to see installed plugins."
+                     Use /plugin marketplace list to see available marketplaces."
                         .to_string(),
                 )
             }
             claurst_plugins::PluginSubCommand::Marketplace(query) => {
-                let result = claurst_plugins::install_plugin_from_marketplace(&query).await;
+                let result = claurst_plugins::install_plugin_from_marketplace(&query, None).await;
                 match result {
-                    Ok(name) => CommandResult::Message(format!(
-                        "Plugin '{}' installed successfully. Run `/plugin reload` to activate it.",
-                        name
+                    Ok(plugin) => CommandResult::Message(format!(
+                        "Plugin '{}' installed. Run `/plugin reload` to activate.", plugin.name
                     )),
                     Err(e) => CommandResult::Error(format!("Marketplace install failed: {}", e)),
                 }
@@ -2058,14 +2133,18 @@ impl SlashCommand for PluginCommand {
             claurst_plugins::PluginSubCommand::Help => {
                 CommandResult::Message(
                     "Plugin commands:\n\
-                     /plugin                  — list all installed plugins\n\
-                     /plugin list             — list all installed plugins\n\
-                     /plugin info <name>      — show plugin details\n\
-                     /plugin enable <name>    — enable a plugin\n\
-                     /plugin disable <name>   — disable a plugin\n\
-                     /plugin install <path>   — install plugin from local path\n\
-                     /plugin marketplace <id> — install from marketplace or GitHub\n\
-                     /plugin reload          — reload plugins from disk"
+                     /plugin                        — list all installed plugins\n\
+                     /plugin list                   — list all installed plugins\n\
+                     /plugin info <name>            — show plugin details\n\
+                     /plugin enable <name>          — enable a plugin\n\
+                     /plugin disable <name>         — disable a plugin\n\
+                     /plugin install <path>         — install plugin from local path\n\
+                     /plugin marketplace add <src>  — add a marketplace by source\n\
+                     /plugin marketplace list       — list cached marketplaces\n\
+                     /plugin marketplace search <q> — search plugins across marketplaces\n\
+                     /plugin marketplace remove <n> — remove a cached marketplace\n\
+                     /plugin marketplace <plugin@marketplace> — install a plugin\n\
+                     /plugin reload                — reload plugins from disk"
                         .to_string(),
                 )
             }
