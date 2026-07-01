@@ -3,16 +3,10 @@
 //! Adds support for:
 //! - `/plugin marketplace add <source>` — add a marketplace by GitHub shorthand, URL, or local path
 //! - `/plugin install plugin@marketplace` — install a specific plugin from a marketplace
-//!
-//! Layout in ~/.claurst/plugins/:
-//!   known_marketplaces.json   — cached marketplace sources
-//!   marketplaces/<name>/      — cloned marketplace repos
-//!   cache/<mkt>/<plugin>/    — cached plugin sources
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -37,16 +31,6 @@ pub struct PluginMarketplaceEntry {
     pub hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-}
-
-impl PluginMarketplaceEntry {
-    pub fn download_url(&self) -> String {
-        if let Some(ref source) = self.source {
-            return source.download_url();
-        }
-        // Fallback: assume it's a relative path in the marketplace repo
-        String::new()
-    }
 }
 
 /// A marketplace manifest (marketplace.json).
@@ -80,7 +64,7 @@ pub struct MarketplaceMetadata {
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum PluginSourceVariant {
     /// Relative path within the marketplace repo.
-    #[serde]
+    #[serde(rename = "path")]
     Path(String),
     /// NPM package.
     Npm {
@@ -118,28 +102,26 @@ pub enum PluginSourceVariant {
 }
 
 impl PluginSourceVariant {
-    /// Get the URL to download this plugin source.
-    pub fn download_url(&self) -> String {
+    /// Get a display string for the source.
+    pub fn display(&self) -> String {
         match self {
             PluginSourceVariant::Path(p) => p.clone(),
             PluginSourceVariant::Npm { package, version, .. } => {
                 if let Some(v) = version {
-                    format!("npm://{}/{}", package, v)
+                    format!("npm:{}@{}", package, v)
                 } else {
-                    format!("npm://{}", package)
+                    format!("npm:{}", package)
                 }
             }
-            PluginSourceVariant::Github { repo, ref, .. } => {
-                if let Some(r) = ref {
-                    format!("github://{}/{}", repo, r)
+            PluginSourceVariant::Github { repo, r#ref, .. } => {
+                if let Some(r) = r#ref {
+                    format!("github:{}/{}", repo, r)
                 } else {
-                    format!("github://{}", repo)
+                    format!("github:{}", repo)
                 }
             }
             PluginSourceVariant::Url { url, .. } => url.clone(),
-            PluginSourceVariant::GitSubdir { url, path, .. } => {
-                format!("{}?path={}", url, path)
-            }
+            PluginSourceVariant::GitSubdir { url, path, .. } => format!("{}?path={}", url, path),
         }
     }
 }
@@ -175,14 +157,13 @@ impl MarketplaceSource {
         // https:// or http:// URL
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             let (url, reference) = Self::extract_url_ref(trimmed);
-            // Detect if it's a GitHub URL
             if url.contains("github.com") {
                 return Some(MarketplaceSource::GitHttps { url: url.to_string(), r#ref: reference });
             }
             return Some(MarketplaceSource::Url { url: url.to_string() });
         }
 
-        // Local file path (starts with ./ or / or C:\ etc)
+        // Local file path (starts with ./ or .\)
         if trimmed.starts_with("./") || trimmed.starts_with(".\\") {
             let path = PathBuf::from(trimmed);
             if path.extension().map(|e| e == "json").unwrap_or(false) {
@@ -267,122 +248,15 @@ pub struct KnownMarketplace {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MarketplaceSourceInfo {
-    #[serde]
+    #[serde(rename = "github")]
     Github { repo: String, r#ref: Option<String> },
-    #[serde]
+    #[serde(rename = "git_ssh")]
     GitSsh { url: String, r#ref: Option<String> },
-    #[serde]
+    #[serde(rename = "git_https")]
     GitHttps { url: String, r#ref: Option<String> },
-    #[serde]
     Url { url: String },
-    #[serde]
     File { path: String },
-    #[serde]
     Directory { path: String },
-}
-
-/// Parse a plugin identifier: "plugin@marketplace" or just "plugin".
-pub fn parse_plugin_identifier(id: &str) -> (String, Option<String>) {
-    if let Some(at_pos) = id.find('@') {
-        let name = id[..at_pos].to_string();
-        let marketplace = id[at_pos + 1..].to_string();
-        (name, Some(marketplace))
-    } else {
-        (id.to_string(), None)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Global cache
-// ---------------------------------------------------------------------------
-
-static KNOWN_MARKETPLACES: OnceLock<HashMap<String, KnownMarketplace>> = OnceLock::new();
-
-fn get_marketplaces_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".claurst")
-        .join("plugins")
-}
-
-fn get_marketplaces_cache_path() -> PathBuf {
-    get_marketplaces_dir().join("known_marketplaces.json")
-}
-
-fn get_marketplaces_install_dir() -> PathBuf {
-    get_marketplaces_dir().join("marketplaces")
-}
-
-fn get_cache_dir() -> PathBuf {
-    get_marketplaces_dir().join("cache")
-}
-
-// ---------------------------------------------------------------------------
-// Marketplace persistence
-// ---------------------------------------------------------------------------
-
-/// Load known marketplaces from disk.
-pub fn load_known_marketplaces() -> HashMap<String, KnownMarketplace> {
-    let path = get_marketplaces_cache_path();
-    if !path.exists() {
-        return HashMap::new();
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
-}
-
-/// Save known marketplaces to disk.
-pub fn save_known_marketplaces(marketplaces: &HashMap<String, KnownMarketplace>) -> anyhow::Result<()> {
-    let path = get_marketplaces_cache_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(marketplaces)?;
-    std::fs::write(&path, content)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Marketplace operations
-// ---------------------------------------------------------------------------
-
-/// Add a marketplace by source string.
-/// Returns the marketplace name and whether it was already cached.
-pub async fn add_marketplace_source(
-    source_str: &str,
-    _options: MarketplaceAddOptions,
-) -> Result<(String, bool), MarketplaceError> {
-    let source = MarketplaceSource::parse(source_str)
-        .ok_or_else(|| MarketplaceError::InvalidSource(source_str.to_string()))?;
-
-    let cache_key = source.cache_key();
-    let mut marketplaces = load_known_marketplaces();
-
-    // Idempotency check — if this exact source already exists, skip
-    for (name, known) in &marketplaces {
-        if known.source.matches(&source) {
-            tracing::debug!("Marketplace '{}' already cached for source '{}'", name, cache_key);
-            return Ok((name.clone(), true));
-        }
-    }
-
-    // Load and cache the marketplace
-    let (name, install_location) = load_and_cache_marketplace(&source).await?;
-
-    let marketplace = KnownMarketplace {
-        name: name.clone(),
-        source: MarketplaceSourceInfo::from_source(&source),
-        install_location: Some(install_location.clone()),
-        last_updated: Some(chrono::Utc::now().to_rfc3339()),
-        auto_update: Some(false),
-    };
-
-    marketplaces.insert(name.clone(), marketplace);
-    save_known_marketplaces(&marketplaces)?;
-
-    Ok((name, false))
 }
 
 impl MarketplaceSourceInfo {
@@ -422,6 +296,70 @@ impl MarketplaceSourceInfo {
     }
 }
 
+/// Parse a plugin identifier: "plugin@marketplace" or just "plugin".
+pub fn parse_plugin_identifier(id: &str) -> (String, Option<String>) {
+    if let Some(at_pos) = id.find('@') {
+        let name = id[..at_pos].to_string();
+        let marketplace = id[at_pos + 1..].to_string();
+        (name, Some(marketplace))
+    } else {
+        (id.to_string(), None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+fn get_marketplaces_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".claurst")
+        .join("plugins")
+}
+
+fn get_marketplaces_cache_path() -> PathBuf {
+    get_marketplaces_dir().join("known_marketplaces.json")
+}
+
+fn get_marketplaces_install_dir() -> PathBuf {
+    get_marketplaces_dir().join("marketplaces")
+}
+
+fn get_cache_dir() -> PathBuf {
+    get_marketplaces_dir().join("cache")
+}
+
+// ---------------------------------------------------------------------------
+// Marketplace persistence
+// ---------------------------------------------------------------------------
+
+/// Load known marketplaces from disk.
+pub fn load_known_marketplaces() -> HashMap<String, KnownMarketplace> {
+    let path = get_marketplaces_cache_path();
+    if !path.exists() {
+        return HashMap::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Save known marketplaces to disk.
+pub fn save_known_marketplaces(marketplaces: &HashMap<String, KnownMarketplace>) -> Result<(), MarketplaceError> {
+    let path = get_marketplaces_cache_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MarketplaceError::Io(e.to_string()))?;
+    }
+    let content = serde_json::to_string_pretty(marketplaces).map_err(|e| MarketplaceError::Serialize(e.to_string()))?;
+    std::fs::write(&path, content).map_err(|e| MarketplaceError::Io(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Marketplace operations
+// ---------------------------------------------------------------------------
+
 /// Options for adding a marketplace.
 #[derive(Debug, Default)]
 pub struct MarketplaceAddOptions {
@@ -429,12 +367,47 @@ pub struct MarketplaceAddOptions {
     pub scope: Option<String>,
 }
 
+/// Add a marketplace by source string.
+/// Returns the marketplace name and whether it was already cached.
+pub async fn add_marketplace_source(
+    source_str: &str,
+    _options: MarketplaceAddOptions,
+) -> Result<(String, bool), MarketplaceError> {
+    let source = MarketplaceSource::parse(source_str)
+        .ok_or_else(|| MarketplaceError::InvalidSource(source_str.to_string()))?;
+
+    let cache_key = source.cache_key();
+    let mut marketplaces = load_known_marketplaces();
+
+    // Idempotency check
+    for (name, known) in &marketplaces {
+        if known.source.matches(&source) {
+            tracing::debug!("Marketplace '{}' already cached for source '{}'", name, cache_key);
+            return Ok((name.clone(), true));
+        }
+    }
+
+    // Load and cache the marketplace
+    let (name, install_location) = load_and_cache_marketplace(&source).await?;
+
+    let marketplace = KnownMarketplace {
+        name: name.clone(),
+        source: MarketplaceSourceInfo::from_source(&source),
+        install_location: Some(install_location),
+        last_updated: Some(chrono::Utc::now().to_rfc3339()),
+        auto_update: Some(false),
+    };
+
+    marketplaces.insert(name.clone(), marketplace);
+    save_known_marketplaces(&marketplaces)?;
+
+    Ok((name, false))
+}
+
 /// Load a marketplace manifest from a source and cache it locally.
-/// Returns (marketplace_name, install_location).
 async fn load_and_cache_marketplace(source: &MarketplaceSource) -> Result<(String, PathBuf), MarketplaceError> {
     let install_dir = get_marketplaces_install_dir();
-    std::fs::create_dir_all(&install_dir)
-        .map_err(|e| MarketplaceError::Io(e.to_string()))?;
+    std::fs::create_dir_all(&install_dir).map_err(|e| MarketplaceError::Io(e.to_string()))?;
 
     match source {
         MarketplaceSource::Github { repo, r#ref } => {
@@ -469,17 +442,14 @@ async fn load_github_marketplace(
     }
     let (owner, repo_name) = (parts[0], parts[1]);
 
-    // Get default branch
     let default_branch = get_github_default_branch(owner, repo_name).await?;
     let branch = r#ref.unwrap_or(&default_branch);
 
     let temp_dir = install_dir.join(format!(".tmp.{}", repo_name.replace('/', "-")));
     let git_url = format!("https://github.com/{}/{}", owner, repo_name);
 
-    // Clone shallow
     clone_git_repo(&git_url, &temp_dir, Some(branch)).await?;
 
-    // Find and parse marketplace.json
     let manifest = find_marketplace_manifest(&temp_dir)?;
     let marketplace: MarketplaceManifest = serde_json::from_str(&manifest)
         .map_err(|e| MarketplaceError::Parse(e.to_string()))?;
@@ -581,7 +551,6 @@ fn load_directory_marketplace(
     path: &PathBuf,
     install_dir: &PathBuf,
 ) -> Result<(String, PathBuf), MarketplaceError> {
-    // Look for .claude-plugin/marketplace.json or marketplace.json
     let manifest_path = path.join(".claude-plugin").join("marketplace.json");
     let fallback_path = path.join("marketplace.json");
     let manifest_path = if manifest_path.exists() {
@@ -607,8 +576,8 @@ fn load_directory_marketplace(
         std::fs::remove_dir_all(&target_dir).ok();
     }
 
-    // Copy directory contents
-    copy_dir_recursive(path, &target_dir)?;
+    copy_dir_recursive(path, &target_dir)
+        .map_err(|e| MarketplaceError::Io(e.to_string()))?;
     Ok((name, target_dir))
 }
 
@@ -628,7 +597,6 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
 
 /// Find marketplace.json in a cloned repo.
 fn find_marketplace_manifest(dir: &PathBuf) -> Result<String, MarketplaceError> {
-    // Check .claude-plugin/marketplace.json first, then marketplace.json
     let paths = [
         dir.join(".claude-plugin").join("marketplace.json"),
         dir.join("marketplace.json"),
@@ -677,11 +645,9 @@ async fn get_github_default_branch(owner: &str, repo: &str) -> Result<String, Ma
 
 /// Clone a git repository shallowly to a target directory.
 async fn clone_git_repo(url: &str, target: &PathBuf, branch: Option<&str>) -> Result<(), MarketplaceError> {
-    use std::process::Stdio;
     use tokio::process::Command;
 
-    std::fs::create_dir_all(target)
-        .map_err(|e| MarketplaceError::Io(e.to_string()))?;
+    std::fs::create_dir_all(target).map_err(|e| MarketplaceError::Io(e.to_string()))?;
 
     let mut cmd = Command::new("git");
     cmd.args(["clone", "--depth=1", "--recurse-submodules"]);
@@ -705,16 +671,15 @@ async fn clone_git_repo(url: &str, target: &PathBuf, branch: Option<&str>) -> Re
 /// Install a plugin by identifier: "plugin@marketplace" or just "plugin".
 pub async fn install_plugin_from_marketplace(
     plugin_id: &str,
-    scope: Option<&str>,
+    _scope: Option<&str>,
 ) -> Result<InstalledPlugin, MarketplaceError> {
     let (plugin_name, marketplace_name) = parse_plugin_identifier(plugin_id);
 
     if let Some(marketplace) = marketplace_name {
         install_from_specific_marketplace(&plugin_name, &marketplace).await
     } else {
-        // Search all known marketplaces
         let marketplaces = load_known_marketplaces();
-        for (name, known) in &marketplaces {
+        for (_name, known) in &marketplaces {
             if let Some(loc) = &known.install_location {
                 if let Ok(plugin) = install_plugin_from_dir(&plugin_name, loc).await {
                     return Ok(plugin);
@@ -758,12 +723,10 @@ async fn install_plugin_from_dir(
     let marketplace: MarketplaceManifest = serde_json::from_str(&content)
         .map_err(|e| MarketplaceError::Parse(e.to_string()))?;
 
-    // Find the plugin entry
     let entry = marketplace.plugins.iter()
         .find(|p| p.name == plugin_name)
         .ok_or_else(|| MarketplaceError::PluginNotFound(plugin_name.to_string()))?;
 
-    // Download/cache the plugin
     let plugin_dir = get_plugin_cache_dir(&marketplace.name, plugin_name);
     download_plugin_source(entry, marketplace_dir, &plugin_dir).await?;
 
@@ -786,15 +749,13 @@ async fn download_plugin_source(
 ) -> Result<(), MarketplaceError> {
     use tokio::process::Command;
 
-    std::fs::create_dir_all(target_dir)
-        .map_err(|e| MarketplaceError::Io(e.to_string()))?;
+    std::fs::create_dir_all(target_dir).map_err(|e| MarketplaceError::Io(e.to_string()))?;
 
     match entry.source.as_ref() {
         Some(PluginSourceVariant::Path(path)) => {
-            // Copy from marketplace directory
             let src = marketplace_dir.join(path);
             if src.is_dir() {
-                copy_dir_recursive(&src, target_dir)?;
+                copy_dir_recursive(&src, target_dir).map_err(|e| MarketplaceError::Io(e.to_string()))?;
             } else {
                 std::fs::copy(&src, target_dir.join("plugin.json"))
                     .map_err(|e| MarketplaceError::Io(e.to_string()))?;
@@ -812,7 +773,7 @@ async fn download_plugin_source(
             clone_git_repo(url, &temp_dir, r#ref.as_deref()).await?;
             let subdir = temp_dir.join(path);
             if subdir.exists() {
-                copy_dir_recursive(&subdir, target_dir)?;
+                copy_dir_recursive(&subdir, target_dir).map_err(|e| MarketplaceError::Io(e.to_string()))?;
                 std::fs::remove_dir_all(&temp_dir).ok();
             }
         }
@@ -829,10 +790,9 @@ async fn download_plugin_source(
                 .map_err(|e| MarketplaceError::Npm(e.to_string()))?;
         }
         None => {
-            // No source specified — assume it's a relative path with same name as plugin
             let src = marketplace_dir.join(&entry.name);
             if src.is_dir() {
-                copy_dir_recursive(&src, target_dir)?;
+                copy_dir_recursive(&src, target_dir).map_err(|e| MarketplaceError::Io(e.to_string()))?;
             } else {
                 return Err(MarketplaceError::Parse(format!(
                     "Plugin '{}' has no source and no directory found in marketplace",
@@ -891,7 +851,6 @@ pub fn remove_marketplace(name: &str) -> Result<(), MarketplaceError> {
 
     save_known_marketplaces(&marketplaces)?;
 
-    // Optionally remove the cached files
     if let Some(loc) = removed.install_location {
         std::fs::remove_dir_all(&loc).ok();
     }
@@ -920,6 +879,9 @@ pub enum MarketplaceError {
     #[error("IO error: {0}")]
     Io(String),
 
+    #[error("Serialize error: {0}")]
+    Serialize(String),
+
     #[error("Parse error: {0}")]
     Parse(String),
 
@@ -931,7 +893,7 @@ pub enum MarketplaceError {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy API compatibility (redirects to new implementation)
+// Legacy API compatibility
 // ---------------------------------------------------------------------------
 
 const REGISTRY_URL: &str = "https://registry.claude.ai/plugins";
@@ -978,7 +940,6 @@ pub async fn marketplace_search(query: &str) -> Result<Vec<InstalledPlugin>, Str
 
 /// Install from the old registry (kept for compatibility).
 pub async fn marketplace_install(name_or_url: &str) -> Result<InstalledPlugin, String> {
-    // Try URL directly
     if name_or_url.starts_with("http") {
         let name = name_or_url.split('/').last()
             .unwrap_or("plugin")
@@ -995,9 +956,7 @@ pub async fn marketplace_install(name_or_url: &str) -> Result<InstalledPlugin, S
         let archive_path = install_dir.join("plugin.zip");
         std::fs::write(&archive_path, &bytes).map_err(|e| e.to_string())?;
 
-        // Try unzip
-        if let Err(_) = try_unzip_flat(&archive_path, &install_dir) {
-            // Not a zip — copy as-is
+        if try_unzip_flat(&archive_path, &install_dir).is_err() {
             let manifest_path = install_dir.join("manifest.json");
             std::fs::copy(&archive_path, &manifest_path).map_err(|e| e.to_string())?;
             std::fs::remove_file(&archive_path).ok();
@@ -1011,13 +970,12 @@ pub async fn marketplace_install(name_or_url: &str) -> Result<InstalledPlugin, S
         });
     }
 
-    // Try GitHub shorthand
     if name_or_url.contains('/') {
         let parts: Vec<&str> = name_or_url.splitn(2, '@').collect();
         let repo = parts[0].to_string();
         let tag = parts.get(1).map(|s| s.to_string());
 
-        let (entry, install_dir) = install_from_github(&repo, tag.as_deref()).await?;
+        let (entry, install_dir) = install_from_github_internal(&repo, tag.as_deref()).await?;
 
         let response = reqwest::get(&entry.download_url).await
             .map_err(|e| e.to_string())?;
@@ -1037,7 +995,6 @@ pub async fn marketplace_install(name_or_url: &str) -> Result<InstalledPlugin, S
         });
     }
 
-    // Search registry
     let results = marketplace_search(name_or_url).await?;
     results.into_iter()
         .find(|p| p.name == name_or_url)
@@ -1049,13 +1006,20 @@ pub async fn install_from_github(
     repo: &str,
     tag: Option<&str>,
 ) -> Result<(RegistryPluginEntry, PathBuf), String> {
+    install_from_github_internal(repo, tag).await
+}
+
+async fn install_from_github_internal(
+    repo: &str,
+    tag: Option<&str>,
+) -> Result<(RegistryPluginEntry, PathBuf), String> {
     let parts: Vec<&str> = repo.split('/').collect();
     if parts.len() != 2 {
         return Err(format!("Invalid GitHub repo format: '{}'", repo));
     }
     let (owner, repo_name) = (parts[0], parts[1]);
 
-    let default_branch = get_github_default_branch(owner, repo_name).await
+    let default_branch = get_github_default_branch_internal(owner, repo_name).await
         .map_err(|e| e.to_string())?;
 
     let download_url = if let Some(tag) = tag {
@@ -1087,6 +1051,33 @@ pub async fn install_from_github(
     ))
 }
 
+async fn get_github_default_branch_internal(owner: &str, repo: &str) -> Result<String, MarketplaceError> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.github.com/repos/{}/{}", owner, repo);
+
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Claurst/1.0")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| MarketplaceError::Network(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(MarketplaceError::Network(format!("GitHub API: {}", resp.status())));
+    }
+
+    let data: serde_json::Value = resp.json().await
+        .map_err(|e| MarketplaceError::Parse(e.to_string()))?;
+
+    let branch = data.get("default_branch")
+        .and_then(|b| b.as_str())
+        .unwrap_or("main")
+        .to_string();
+
+    Ok(branch)
+}
+
 /// Try to unzip an archive into a flat directory.
 fn try_unzip_flat(archive: &PathBuf, dest: &PathBuf) -> Result<(), String> {
     let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
@@ -1110,7 +1101,7 @@ fn try_unzip_flat(archive: &PathBuf, dest: &PathBuf) -> Result<(), String> {
             .map(|e| e.path())
             .ok_or_else(|| "No subdirectory found in archive".to_string())?;
 
-        move_dir_contents(&subdir, dest)?;
+        move_dir_contents(&subdir, dest).map_err(|e| e.to_string())?;
         std::fs::remove_dir_all(&temp_dir).ok();
     } else {
         zip.extract(dest).map_err(|e| e.to_string())?;
@@ -1181,8 +1172,6 @@ pub fn list_installed() -> Vec<InstalledPlugin> {
                     let name = path.file_name()?.to_string_lossy().to_string();
 
                     let json_path = path.join("manifest.json");
-                    let yaml_path = path.join("manifest.yaml");
-                    let toml_path = path.join("plugin.toml");
                     let json_path2 = path.join("plugin.json");
 
                     let (version, description) = if json_path.exists() {
