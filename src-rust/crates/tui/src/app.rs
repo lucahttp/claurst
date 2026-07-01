@@ -675,6 +675,44 @@ fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
     })
 }
 
+/// Rewrite a Ctrl-modified keystroke that carries a non-ASCII character to the
+/// Latin letter at the same physical QWERTY position.
+///
+/// A few core shortcuts — most importantly Ctrl+C (interrupt / exit) and Ctrl+D
+/// (exit) — are matched directly against `KeyEvent::code` in `handle_key_event`
+/// rather than going through the keybinding table (they are intentionally absent
+/// from `default_bindings`, see `NON_REBINDABLE`). On a non-Latin layout
+/// (Ukrainian / Russian JCUKEN, …) the reported character is the Cyrillic glyph
+/// at that physical key — e.g. Ctrl+С arrives as `Char('с')` — so the literal
+/// `KeyCode::Char('c')` arms never fire and the shortcut is dead.
+///
+/// Normalizing once at the top of `handle_key_event` lets every downstream
+/// `key.code` comparison (and the keybinding layer, idempotently) see the Latin
+/// letter, mirroring what `key_event_to_keystroke` already does for bound keys.
+///
+/// Restricted to **pure Ctrl (Ctrl without Alt)** on purpose: Ctrl+<letter>
+/// never produces literal text, so rewriting it cannot corrupt text entry,
+/// whereas Alt / AltGr (reported as Ctrl+Alt) is used to compose characters on
+/// some layouts and must be left untouched. Characters with no known
+/// position mapping (or that map to a non-ASCII result) are returned unchanged.
+fn normalize_layout_shortcut_key(key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(c) = key.code {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if ctrl && !alt && !c.is_ascii() {
+            if let Some(latin) = layout_to_latin(c).chars().next() {
+                if latin.is_ascii() {
+                    return KeyEvent {
+                        code: KeyCode::Char(latin),
+                        ..key
+                    };
+                }
+            }
+        }
+    }
+    key
+}
+
 // ---------------------------------------------------------------------------
 // Focus target
 // ---------------------------------------------------------------------------
@@ -717,6 +755,16 @@ pub struct App {
     pub spinner_verb: Option<String>,
     pub should_exit: bool,
     pub show_help: bool,
+    /// Whether the terminal speaks the kitty keyboard protocol (progressive
+    /// keyboard enhancement is active). When `false` — e.g. Windows conhost /
+    /// CMD / legacy PowerShell and most default terminals — printable keys
+    /// arrive as their final, layout-correct character (Shift already applied),
+    /// so we must NOT re-apply a US-QWERTY shift map to them (issue #183: typing
+    /// `/` produced `?`). When `true`, the terminal reports the unshifted base
+    /// key plus a SHIFT modifier, so we normalize it ourselves. Defaults to
+    /// `true`; the run loop overwrites it with the detected value once the
+    /// terminal has been initialized.
+    pub kitty_keyboard_active: bool,
 
     // Extended state
     pub tool_use_blocks: Vec<ToolUseBlock>,
@@ -881,6 +929,17 @@ pub struct App {
     pub context_viz: ContextVizState,
     /// MCP server approval dialog.
     pub mcp_approval: McpApprovalDialogState,
+    /// Project-defined MCP servers awaiting the user's approval decision.
+    /// Populated at startup with the gated (untrusted) project servers; the
+    /// main loop shows one approval dialog at a time, draining this queue.
+    pub mcp_pending_project: std::collections::VecDeque<claurst_core::config::McpServerConfig>,
+    /// The project MCP server currently shown in the approval dialog, if any.
+    pub mcp_prompting: Option<claurst_core::config::McpServerConfig>,
+    /// Fingerprints of project MCP servers approved for THIS session only
+    /// (the "Allow this session" choice). Not persisted to disk.
+    pub mcp_session_trusted: std::collections::HashSet<String>,
+    /// Project root used to key persistent MCP trust approvals.
+    pub mcp_project_root: Option<std::path::PathBuf>,
     /// Go to Line dialog (Ctrl+G in message pane).
     pub go_to_line_dialog: GoToLineDialog,
     /// Bypass-permissions startup confirmation dialog.
@@ -1217,6 +1276,7 @@ impl App {
             spinner_verb: None,
             should_exit: false,
             show_help: false,
+            kitty_keyboard_active: true,
             tool_use_blocks: Vec::new(),
             permission_request: None,
             frame_count: 0,
@@ -1297,6 +1357,10 @@ impl App {
             export_dialog: ExportDialogState::new(),
             context_viz: ContextVizState::new(),
             mcp_approval: McpApprovalDialogState::new(),
+            mcp_pending_project: std::collections::VecDeque::new(),
+            mcp_prompting: None,
+            mcp_session_trusted: std::collections::HashSet::new(),
+            mcp_project_root: None,
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
@@ -1638,9 +1702,19 @@ impl App {
             &self.model_registry,
         );
         self.model_picker.set_models(models);
-        self.model_picker.loading_models = true;
         self.model_picker_provider_id = Some(provider_id.to_string());
-        self.model_picker_fetch_pending = true;
+        // Catalog-backed providers (Anthropic/OpenAI/Google) are a read-only
+        // projection of the models.dev catalog — there is no live endpoint to
+        // discover from, so skip the background fetch entirely and treat the
+        // projection as final. Live-endpoint / curated-list providers still
+        // fetch their real model list to overlay onto the projection.
+        if crate::model_picker::provider_uses_catalog_projection(provider_id) {
+            self.model_picker.loading_models = false;
+            self.model_picker_fetch_pending = false;
+        } else {
+            self.model_picker.loading_models = true;
+            self.model_picker_fetch_pending = true;
+        }
 
         let provider_prefix = format!("{}/", provider_id);
         let current_model = if self.config.provider.as_deref() == Some(provider_id) {
@@ -2771,13 +2845,81 @@ impl App {
         pending
     }
 
-    /// Returns and clears any pending MCP approval result.
-    pub fn take_mcp_approval_result(&mut self) -> Option<crate::dialogs::McpApprovalChoice> {
-        if !self.mcp_approval.visible {
-            return None;
+    /// If a project MCP server is waiting for approval and no approval dialog
+    /// is currently open, pop the next one and show the approval dialog for it.
+    ///
+    /// Called from the main loop. Returns `true` when a dialog was shown.
+    pub fn maybe_prompt_next_mcp_server(&mut self) -> bool {
+        if self.mcp_approval.visible || self.mcp_prompting.is_some() {
+            return false;
         }
-        // The dialog closes itself on confirm; we check if it's now closed
-        None // Actual result is read by CLI loop via mcp_approval.visible + confirm()
+        if let Some(server) = self.mcp_pending_project.pop_front() {
+            self.mcp_approval.show(
+                &server.name,
+                server.url.as_deref(),
+                server.command.as_deref(),
+                // Tools are unknown until the server is launched; the dialog
+                // shows the command/url so the user can judge before running it.
+                Vec::new(),
+            );
+            self.mcp_prompting = Some(server);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply the user's decision for the project MCP server currently shown in
+    /// the approval dialog. Persists "always allow" choices to the on-disk
+    /// trust store and requests an MCP reconnect when a server is approved.
+    pub fn handle_mcp_approval_decision(&mut self, choice: crate::dialogs::McpApprovalChoice) {
+        use crate::dialogs::McpApprovalChoice;
+        let server = match self.mcp_prompting.take() {
+            Some(s) => s,
+            None => return,
+        };
+        match choice {
+            McpApprovalChoice::AllowSession => {
+                self.mcp_session_trusted
+                    .insert(claurst_core::mcp_trust::server_fingerprint(&server));
+                self.pending_mcp_reconnect = true;
+                self.status_message = Some(format!(
+                    "Approved MCP server '{}' for this session.",
+                    server.name
+                ));
+            }
+            McpApprovalChoice::AllowAlways => {
+                self.mcp_session_trusted
+                    .insert(claurst_core::mcp_trust::server_fingerprint(&server));
+                if let Some(root) = self.mcp_project_root.clone() {
+                    let mut store = claurst_core::mcp_trust::McpTrustStore::load();
+                    store.approve(&root, &server);
+                    if let Err(e) = store.save() {
+                        self.status_message = Some(format!(
+                            "Approved '{}', but failed to persist trust: {}",
+                            server.name, e
+                        ));
+                    } else {
+                        self.status_message = Some(format!(
+                            "Always allowing MCP server '{}' for this project.",
+                            server.name
+                        ));
+                    }
+                } else {
+                    self.status_message = Some(format!(
+                        "Approved MCP server '{}' (no project root to persist to).",
+                        server.name
+                    ));
+                }
+                self.pending_mcp_reconnect = true;
+            }
+            McpApprovalChoice::Deny => {
+                self.status_message = Some(format!(
+                    "Skipped project MCP server '{}'.",
+                    server.name
+                ));
+            }
+        }
     }
 
     /// Detect the current PR from environment variables or git.
@@ -2863,9 +3005,74 @@ impl App {
         Self::persist_onboarding_complete()
     }
 
+    /// Resolve the character to insert for a printable key press, applying the
+    /// US-QWERTY shift map only when the kitty keyboard protocol is active.
+    ///
+    /// On terminals that do NOT speak the kitty protocol (Windows conhost / CMD
+    /// / legacy PowerShell and most default terminals) the character is already
+    /// final and layout-correct — Shift has been applied by the OS — so we pass
+    /// it through untouched. Re-shifting it here would double-shift and corrupt
+    /// input, e.g. turning a literal `/` (typed via Shift on many non-US
+    /// layouts) into `?` (issue #183).
+    fn shift_normalize(&self, c: char, modifiers: KeyModifiers) -> char {
+        if self.kitty_keyboard_active {
+            normalize_char_with_shift(c, modifiers)
+        } else {
+            c
+        }
+    }
+
+    /// Handle Enter while a typeahead popup is open. Accepts the highlighted
+    /// suggestion and returns whether the prompt should now be submitted.
+    ///
+    /// - Slash command: complete the highlighted command *and* run it in a
+    ///   single Enter — the popup acts as a command menu, so a second Enter to
+    ///   "run" it should not be required (issue #183). Returns `true`.
+    /// - File reference: complete the path, append a space, and keep editing so
+    ///   the user can continue the prompt. Returns `false`.
+    /// - History recall (or anything else): complete and keep editing so the
+    ///   recalled text isn't fired off unexpectedly. Returns `false`.
+    ///
+    /// Callers must only invoke this when a suggestion is actually selected.
+    fn accept_suggestion_for_submit(&mut self) -> bool {
+        use crate::prompt_input::TypeaheadSource;
+        let source = self
+            .prompt_input
+            .suggestion_index
+            .and_then(|i| self.prompt_input.suggestions.get(i))
+            .map(|s| s.source.clone());
+        match source {
+            Some(TypeaheadSource::SlashCommand) => {
+                self.prompt_input.accept_suggestion();
+                // Sync legacy mirror fields without recomputing suggestions, so
+                // the just-completed command isn't re-suggested behind the popup.
+                self.sync_legacy_prompt_fields();
+                true
+            }
+            Some(TypeaheadSource::FileRef) => {
+                self.prompt_input.accept_suggestion();
+                self.prompt_input.insert_char(' ');
+                self.refresh_prompt_input();
+                false
+            }
+            _ => {
+                self.prompt_input.accept_suggestion();
+                self.refresh_prompt_input();
+                false
+            }
+        }
+    }
+
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        // Make Ctrl shortcuts layout-independent before any handler runs: on
+        // non-Latin layouts (Ukrainian / Russian, …) a Ctrl combo reports the
+        // Cyrillic glyph at the physical key, which would otherwise miss the
+        // literal `KeyCode::Char(..)` arms below — including Ctrl+C / Ctrl+D,
+        // which are matched here rather than via the keybinding table (issue #47).
+        let key = normalize_layout_shortcut_key(key);
+
         // Dismiss error modal with Esc
         if key.code == KeyCode::Esc && self.notifications.current_is_error() {
             self.dismiss_error_notifications();
@@ -3065,7 +3272,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.ask_user_dialog.push_char(c);
                 }
                 KeyCode::Backspace => {
@@ -3110,7 +3317,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.key_input_dialog.insert_char(c);
                 }
                 _ => {}
@@ -3153,7 +3360,7 @@ impl App {
                     self.free_mode_dialog.backspace();
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.free_mode_dialog.insert_char(c);
                 }
                 _ => {}
@@ -3192,7 +3399,7 @@ impl App {
                     self.custom_provider_dialog.backspace();
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.custom_provider_dialog.insert_char(c);
                 }
                 _ => {}
@@ -3563,9 +3770,8 @@ impl App {
 
         // MCP approval dialog
         if self.mcp_approval.visible {
-            let result = crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key);
-            if result.is_some() {
-                // Result processed by CLI loop via take_mcp_approval_result()
+            if let Some(choice) = crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key) {
+                self.handle_mcp_approval_decision(choice);
             }
             return false;
         }
@@ -3795,7 +4001,7 @@ impl App {
                     return false;
                 }
                 KeyCode::Char(c) => {
-                    let c = normalize_char_with_shift(c, key.modifiers);
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.elicitation.insert_char(c);
                     return false;
                 }
@@ -4058,8 +4264,14 @@ impl App {
             }
             // With the kitty keyboard protocol, Shift+/ is reported as Char('/') with
             // SHIFT rather than Char('?'), so also accept that form for the help toggle.
+            // This MUST be gated on the kitty protocol being active: on terminals that
+            // don't speak it (Windows conhost / CMD / legacy PowerShell), a Char('/')
+            // carrying a SHIFT flag is just a literal slash typed on a layout where `/`
+            // is a shifted key — it must fall through to text entry so the user can
+            // actually start a slash command (issue #183).
             KeyCode::Char('/')
-                if key.modifiers.contains(KeyModifiers::SHIFT)
+                if self.kitty_keyboard_active
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
                     && !self.is_streaming
                     && self.prompt_input.is_empty()
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -4116,7 +4328,7 @@ impl App {
             // ---- Text entry (allowed while streaming so users can queue
             // the next message; submission queues via Enter at the CLI layer).
             KeyCode::Char(c) => {
-                let c = normalize_char_with_shift(c, key.modifiers);
+                let c = self.shift_normalize(c, key.modifiers);
                 if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
                     self.prompt_input.vim_command(&c.to_string());
                 } else {
@@ -4215,18 +4427,15 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Enter if !self.is_streaming => {
-                // If a suggestion is selected, accept it instead of submitting.
+                // Fallback Enter handling for when the keybinding layer doesn't
+                // claim Enter (e.g. it's been unbound); the default path is the
+                // "submit" keybinding action. If a typeahead popup is open, let
+                // the shared helper decide whether to complete a suggestion or
+                // also run it (issue #183).
                 if !self.prompt_input.suggestions.is_empty()
                     && self.prompt_input.suggestion_index.is_some()
+                    && !self.accept_suggestion_for_submit()
                 {
-                    let is_file_ref = self.prompt_input.suggestions
-                        .get(self.prompt_input.suggestion_index.unwrap())
-                        .map_or(false, |s| s.source == crate::prompt_input::TypeaheadSource::FileRef);
-                    self.prompt_input.accept_suggestion();
-                    if is_file_ref {
-                        self.prompt_input.insert_char(' ');
-                    }
-                    self.refresh_prompt_input();
                     return false;
                 }
                 // Auto-dismiss all error notifications when user sends a message
@@ -4417,7 +4626,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let ch = normalize_char_with_shift(ch, key.modifiers);
+                    let ch = self.shift_normalize(ch, key.modifiers);
                     self.agents_menu.editor_insert_char(ch);
                 }
                 _ => {}
@@ -4556,7 +4765,7 @@ impl App {
                 self.history_search_overlay.toggle_pin();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let c = normalize_char_with_shift(c, key.modifiers);
+                let c = self.shift_normalize(c, key.modifiers);
                 let history = self.prompt_input.history.clone();
                 self.history_search_overlay.push_char(c, &history);
                 if let Some(hs) = self.history_search.as_mut() {
@@ -4628,7 +4837,7 @@ impl App {
                 self.refresh_global_search();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let c = normalize_char_with_shift(c, key.modifiers);
+                let c = self.shift_normalize(c, key.modifiers);
                 self.global_search.push_char(c);
                 self.refresh_global_search();
             }
@@ -4729,9 +4938,7 @@ impl App {
                     if !self.prompt_input.suggestions.is_empty()
                         && self.prompt_input.suggestion_index.is_some()
                     {
-                        self.prompt_input.accept_suggestion();
-                        self.refresh_prompt_input();
-                        false
+                        self.accept_suggestion_for_submit()
                     } else {
                         true
                     }
@@ -5530,6 +5737,15 @@ impl App {
     /// Process mouse events (trackpad scroll, text selection, etc.).
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         use crossterm::event::MouseButton;
+
+        // When mouse capture is disabled (mouseCapture: false, issue #104) the
+        // terminal keeps the mouse for native click-drag selection / copy-paste,
+        // so the app must not act on any mouse events that still slip through.
+        // Keyboard scrolling (PageUp/PageDown, etc.) is handled elsewhere and is
+        // unaffected by this gate.
+        if !self.config.mouse_capture_enabled() {
+            return;
+        }
 
         // Fast-reject mouse-move events — they flood at 60+ Hz and we don't
         // need hover tracking. Exception: context menu needs hover to update
@@ -6409,6 +6625,39 @@ mod tests {
         }
     }
 
+    // ---- mouse capture gate (issue #104) ----
+
+    fn scroll_up_event() -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_events_processed_when_capture_enabled() {
+        // Default config leaves mouse capture on, so a scroll wheel event
+        // should move the scroll offset.
+        let mut app = make_app();
+        assert!(app.config.mouse_capture_enabled());
+        assert_eq!(app.scroll_offset, 0);
+        app.handle_mouse_event(scroll_up_event());
+        assert!(app.scroll_offset > 0, "scroll should advance when capture is on");
+    }
+
+    #[test]
+    fn mouse_events_ignored_when_capture_disabled() {
+        // With mouseCapture: false the app must not act on mouse events that
+        // still slip through, so the scroll offset stays put.
+        let mut app = make_app();
+        app.config.mouse_capture = Some(false);
+        assert!(!app.config.mouse_capture_enabled());
+        app.handle_mouse_event(scroll_up_event());
+        assert_eq!(app.scroll_offset, 0, "scroll must not move when capture is off");
+    }
+
     // ---- normalize_char_with_shift tests ----
 
     #[test]
@@ -6481,6 +6730,99 @@ mod tests {
             normalize_char_with_shift('1', KeyModifiers::SHIFT | KeyModifiers::ALT),
             '!'
         );
+    }
+
+    // ---- issue #183: slash command input & execution on Windows / non-kitty terminals ----
+
+    #[test]
+    fn test_slash_inserts_literal_slash_when_shift_flagged_on_non_kitty_terminal() {
+        // On terminals that don't speak the kitty protocol (Windows conhost / CMD
+        // / legacy PowerShell, and non-US layouts where `/` is a shifted key) the
+        // slash key can arrive as Char('/') carrying a SHIFT flag, with the
+        // character already final. We must insert a literal `/`, not re-shift it
+        // into `?` (issue #183).
+        let mut app = make_app();
+        app.kitty_keyboard_active = false;
+        // Pre-fill so the empty-prompt `?`/`/` help shortcut is out of the picture.
+        app.prompt_input.text = "x".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.prompt_input.text, "x/");
+    }
+
+    #[test]
+    fn test_slash_with_shift_flag_starts_command_not_help_on_non_kitty_terminal() {
+        // Empty prompt: pressing `/` (reported as Char('/') + SHIFT on a non-kitty
+        // terminal) must insert a literal slash so the user can start a command,
+        // NOT toggle the help overlay (issue #183 — "Cannot run any slash commands").
+        let mut app = make_app();
+        app.kitty_keyboard_active = false;
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert!(
+            !app.help_overlay.visible,
+            "a literal slash must not open the help overlay"
+        );
+        assert!(!app.show_help);
+        assert_eq!(app.prompt_input.text, "/");
+    }
+
+    #[test]
+    fn test_shift_slash_still_normalizes_to_question_under_kitty_protocol() {
+        // With the kitty protocol active, Shift+/ arrives as the unshifted base
+        // key Char('/') + SHIFT, so we DO apply the US-QWERTY shift map → `?`.
+        let mut app = make_app();
+        app.kitty_keyboard_active = true;
+        app.prompt_input.text = "x".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.prompt_input.text, "x?");
+    }
+
+    #[test]
+    fn test_enter_runs_highlighted_slash_command_in_one_press() {
+        // Typing a slash command and pressing Enter should run it immediately
+        // rather than merely completing the text and waiting for a second Enter
+        // (issue #183 — "enter will not run the command").
+        let mut app = make_app();
+        for c in "/help".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(
+            !app.prompt_input.suggestions.is_empty(),
+            "the slash-command popup should be open"
+        );
+
+        let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(should_submit, "Enter should submit/run the highlighted command");
+        assert_eq!(app.prompt_input.text, "/help");
+        assert!(
+            app.prompt_input.suggestions.is_empty(),
+            "the popup should be dismissed after running"
+        );
+    }
+
+    #[test]
+    fn test_enter_completes_slash_prefix_then_runs() {
+        // Even from a unique prefix, Enter completes to the highlighted command
+        // and runs it in a single press.
+        let mut app = make_app();
+        for c in "/the".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(should_submit);
+        assert_eq!(app.prompt_input.text, "/theme");
     }
 
     #[test]
@@ -6785,5 +7127,195 @@ mod tests {
 
         assert!(app.permission_request.is_none());
         assert!(!app.bash_command_allowed_by_prefix("npm test"));
+    }
+
+    // ---- issue #47: shortcuts on non-English (Cyrillic) keyboard layouts ----
+
+    #[test]
+    fn test_layout_to_latin_maps_cyrillic_shortcut_positions() {
+        // Letters used by core Ctrl/Alt shortcuts must resolve to the Latin key
+        // at the same physical QWERTY position on the Russian/Ukrainian JCUKEN
+        // layout. (left = Cyrillic glyph reported by the terminal, right = Latin)
+        assert_eq!(layout_to_latin('с'), "c"); // Ctrl+C  (interrupt / exit)
+        assert_eq!(layout_to_latin('в'), "d"); // Ctrl+D  (exit)
+        assert_eq!(layout_to_latin('к'), "r"); // Ctrl+R  (history search)
+        assert_eq!(layout_to_latin('и'), "b"); // Ctrl+B  (create branch)
+        assert_eq!(layout_to_latin('з'), "p"); // Ctrl+P  (global search)
+        assert_eq!(layout_to_latin('е'), "t"); // Ctrl+T  (tasks overlay)
+        assert_eq!(layout_to_latin('т'), "n"); // n
+        assert_eq!(layout_to_latin('о'), "j"); // Ctrl+J  (newline fallback)
+        assert_eq!(layout_to_latin('г'), "u"); // Ctrl+U  (kill to start)
+        assert_eq!(layout_to_latin('ц'), "w"); // Ctrl+W  (kill word)
+        assert_eq!(layout_to_latin('л'), "k"); // Ctrl+K  (command palette)
+        assert_eq!(layout_to_latin('а'), "f"); // Alt+F   (word forward)
+        assert_eq!(layout_to_latin('н'), "y"); // Ctrl+Y  (yank)
+    }
+
+    #[test]
+    fn test_layout_to_latin_covers_full_qwerty_letter_row() {
+        // Every Latin letter position should be reachable from some Cyrillic key,
+        // so every Ctrl/Alt+<letter> binding works regardless of layout.
+        let cyrillic = "йцукенгшщзфывапролдячсмить";
+        let mut latin: Vec<char> = cyrillic
+            .chars()
+            .filter_map(|c| layout_to_latin(c).chars().next())
+            .filter(|c| c.is_ascii_alphabetic())
+            .collect();
+        latin.sort_unstable();
+        latin.dedup();
+        assert_eq!(latin.len(), 26, "all 26 Latin letters must be covered");
+    }
+
+    #[test]
+    fn test_layout_to_latin_uppercase_cyrillic_folds_to_lowercase_latin() {
+        // Shift+Ctrl on a Cyrillic layout reports the uppercase glyph.
+        assert_eq!(layout_to_latin('С'), "c");
+        assert_eq!(layout_to_latin('В'), "d");
+    }
+
+    #[test]
+    fn test_layout_to_latin_passes_through_unknown_chars() {
+        // Plain ASCII and unmapped characters are returned unchanged (lowercased).
+        assert_eq!(layout_to_latin('c'), "c");
+        assert_eq!(layout_to_latin('A'), "a");
+    }
+
+    #[test]
+    fn test_key_event_to_keystroke_maps_ctrl_cyrillic_to_latin() {
+        // Ctrl+С (Cyrillic) on a non-Latin layout must resolve to the Latin "c".
+        let ks = key_event_to_keystroke(&press_key(
+            KeyCode::Char('с'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("keystroke");
+        assert_eq!(ks.key, "c");
+        assert!(ks.ctrl);
+
+        // Ctrl+О (Cyrillic, the physical J key) → "j" so Ctrl+J newline works.
+        let ks = key_event_to_keystroke(&press_key(
+            KeyCode::Char('о'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("keystroke");
+        assert_eq!(ks.key, "j");
+    }
+
+    #[test]
+    fn test_key_event_to_keystroke_keeps_plain_cyrillic_for_text_entry() {
+        // Without a modifier the character must NOT be Latinized — it is literal
+        // text the user is typing.
+        let ks = key_event_to_keystroke(&press_key(KeyCode::Char('с'), KeyModifiers::NONE))
+            .expect("keystroke");
+        assert_eq!(ks.key, "с");
+        assert!(!ks.ctrl && !ks.alt);
+    }
+
+    #[test]
+    fn test_normalize_layout_shortcut_key_rewrites_pure_ctrl() {
+        // Pure Ctrl + Cyrillic → Latin letter at the same physical position.
+        let out = normalize_layout_shortcut_key(press_key(
+            KeyCode::Char('с'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(out.code, KeyCode::Char('c'));
+        assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn test_normalize_layout_shortcut_key_leaves_plain_and_altgr_untouched() {
+        // No modifier: literal text entry — must stay Cyrillic.
+        let out = normalize_layout_shortcut_key(press_key(KeyCode::Char('с'), KeyModifiers::NONE));
+        assert_eq!(out.code, KeyCode::Char('с'));
+
+        // Ctrl+Alt (AltGr) can compose characters on some layouts — leave it.
+        let out = normalize_layout_shortcut_key(press_key(
+            KeyCode::Char('с'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(out.code, KeyCode::Char('с'));
+
+        // Plain Alt is also left alone (avoid disturbing Option/meta composition).
+        let out = normalize_layout_shortcut_key(press_key(KeyCode::Char('с'), KeyModifiers::ALT));
+        assert_eq!(out.code, KeyCode::Char('с'));
+    }
+
+    #[test]
+    fn test_normalize_layout_shortcut_key_passes_ascii_through() {
+        // ASCII Ctrl combos (English layout) are unchanged — no regression.
+        let out = normalize_layout_shortcut_key(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(out.code, KeyCode::Char('c'));
+    }
+
+    #[test]
+    fn test_ctrl_cyrillic_o_inserts_newline_like_ctrl_j() {
+        // On a Cyrillic layout the physical Ctrl+J key reports Ctrl+О; it must
+        // still insert a newline so multi-line composing works (issue #47).
+        let mut app = make_app();
+        app.prompt_input.text = "ab".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('о'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.prompt_input.text, "ab\n");
+    }
+
+    #[test]
+    fn test_ctrl_j_inserts_newline_on_english_layout() {
+        // Regression guard: the English Ctrl+J path still inserts a newline.
+        let mut app = make_app();
+        app.prompt_input.text = "ab".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.prompt_input.text, "ab\n");
+    }
+
+    #[test]
+    fn test_raw_newline_char_inserts_newline() {
+        // A bare LF (0x0A) arriving as Char('\n') — e.g. Shift+Enter on a
+        // terminal without the kitty protocol — must add a newline, not be
+        // dropped.
+        let mut app = make_app();
+        app.prompt_input.text = "ab".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('\n'), KeyModifiers::NONE));
+
+        assert_eq!(app.prompt_input.text, "ab\n");
+    }
+
+    #[test]
+    fn test_ctrl_cyrillic_c_triggers_exit_confirmation_on_cyrillic_layout() {
+        // Ctrl+С (Cyrillic) on an empty prompt must arm the two-press exit
+        // confirmation exactly like the English Ctrl+C (issue #47 — "Ctrl combos
+        // don't work").
+        let mut app = make_app();
+        assert!(app.prompt_input.is_empty());
+
+        app.handle_key_event(press_key(KeyCode::Char('с'), KeyModifiers::CONTROL));
+        assert!(
+            app.last_exit_key_warning.is_some(),
+            "first Ctrl+С should arm the exit confirmation"
+        );
+        assert!(!app.should_exit);
+
+        // Second press within the timeout exits.
+        app.handle_key_event(press_key(KeyCode::Char('с'), KeyModifiers::CONTROL));
+        assert!(app.should_exit, "second Ctrl+С should exit");
+    }
+
+    #[test]
+    fn test_ctrl_c_still_triggers_exit_confirmation_on_english_layout() {
+        // Regression guard: the English Ctrl+C exit confirmation is unchanged.
+        let mut app = make_app();
+        app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.last_exit_key_warning.is_some());
+        assert!(!app.should_exit);
+        app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_exit);
     }
 }

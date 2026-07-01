@@ -17,7 +17,7 @@
 use std::pin::Pin;
 use async_stream::stream;
 use async_trait::async_trait;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{
     ContentBlock, ImageSource, MessageContent, Role, ToolResultContent, UsageInfo,
 };
@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::error_handling::parse_error_response;
-use crate::provider::{LlmProvider, ModelInfo};
+use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
@@ -51,7 +51,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(api_key: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -730,7 +730,34 @@ impl LlmProvider for OpenAiProvider {
                 (String, String, String),
             > = std::collections::HashMap::new();
 
-            while let Some(chunk_result) = byte_stream.next().await {
+            // Bound infinite mid-stream stalls (issue #185): wrap each chunk
+            // read in a generous idle timeout so a provider that pauses
+            // indefinitely surfaces an error instead of hanging. Each chunk
+            // resets the timer, so slow-but-progressing models are never cut off.
+            let idle_timeout = crate::stream_idle_timeout();
+            loop {
+                let chunk_result = match tokio::time::timeout(
+                    idle_timeout,
+                    byte_stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(chunk_result)) => chunk_result,
+                    // Stream ended normally.
+                    Ok(None) => break,
+                    // No bytes for `idle_timeout` — provider stalled mid-stream.
+                    Err(_) => {
+                        yield Err(ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!(
+                                "Stream stalled: no data received for {}s; aborting to avoid hanging",
+                                idle_timeout.as_secs()
+                            ),
+                            partial_response: None,
+                        });
+                        return;
+                    }
+                };
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
@@ -937,81 +964,6 @@ impl LlmProvider for OpenAiProvider {
         };
 
         Ok(Box::pin(s))
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        let (auth_key, auth_val) = self.auth_header();
-        let url = format!("{}/v1/models", self.base_url);
-
-        let resp = self
-            .http_client
-            .get(&url)
-            .header(auth_key, auth_val)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
-
-        let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| ProviderError::Other {
-            provider: self.id.clone(),
-            message: format!("Failed to read response body: {}", e),
-            status: Some(status),
-            body: None,
-        })?;
-
-        if !(200..300).contains(&(status as usize)) {
-            return Err(self.map_http_error(status, &text));
-        }
-
-        let json: Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to parse models JSON: {}", e),
-                status: Some(status),
-                body: Some(text),
-            })?;
-
-        let data = match json.get("data").and_then(|d| d.as_array()) {
-            Some(d) => d,
-            None => return Ok(vec![]),
-        };
-
-        let provider_id = self.id.clone();
-        let models: Vec<ModelInfo> = data
-            .iter()
-            .filter_map(|m| {
-                let id = m.get("id").and_then(|v| v.as_str())?;
-                // Only return GPT, O3, O4 family models.
-                if !id.starts_with("gpt-")
-                    && !id.starts_with("o3")
-                    && !id.starts_with("o4")
-                    && !id.starts_with("o1")
-                {
-                    return None;
-                }
-                Some(ModelInfo {
-                    id: ModelId::new(id),
-                    provider_id: provider_id.clone(),
-                    name: id.to_string(),
-                    context_window: match id {
-                        "gpt-5" | "gpt-5.4" | "gpt-5.2" | "gpt-5-mini" | "gpt-5-nano"
-                        | "gpt-5-chat-latest"
-                        | "gpt-5.2-codex" | "gpt-5.1-codex" | "gpt-5.1-codex-mini"
-                        | "gpt-5.1-codex-max" => 400_000,
-                        "o3" | "o3-mini" | "o4-mini" => 200_000,
-                        _ => 128_000,
-                    },
-                    max_output_tokens: 16_384,
-                })
-            })
-            .collect();
-
-        Ok(models)
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {

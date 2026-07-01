@@ -42,7 +42,7 @@ impl CohereProvider {
     /// Create a new CohereProvider with the given API key.
     pub fn new(api_key: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -653,7 +653,7 @@ impl LlmProvider for CohereProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         Ok(vec![
             ModelInfo {
                 id: ModelId::new("command-r-plus"),
@@ -661,6 +661,7 @@ impl LlmProvider for CohereProvider {
                 name: "Command R+".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 4_000,
+                ..Default::default()
             },
             ModelInfo {
                 id: ModelId::new("command-r"),
@@ -668,6 +669,7 @@ impl LlmProvider for CohereProvider {
                 name: "Command R".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 4_000,
+                ..Default::default()
             },
         ])
     }

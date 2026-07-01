@@ -38,7 +38,7 @@ impl MinimaxProvider {
         headers.insert("X-Api-Key", header::HeaderValue::from_str(&api_key).expect("unable to parse api key for http header"));
         let http_client = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("MinimaxProvider: failed to build HTTP client");
 
@@ -583,7 +583,7 @@ impl LlmProvider for MinimaxProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let minimax_id = ProviderId::new(ProviderId::MINIMAX);
         Ok(vec![
             ModelInfo {
@@ -592,6 +592,7 @@ impl LlmProvider for MinimaxProvider {
                 name: "MiniMax-M2.7".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 8192,
+                ..Default::default()
             },
         ])
     }

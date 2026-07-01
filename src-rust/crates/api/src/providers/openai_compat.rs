@@ -83,7 +83,7 @@ pub struct ProviderQuirks {
     /// "No API key configured".
     pub no_api_key_required: bool,
 
-    /// When set, `list_models()` uses Ollama's native `/api/tags` endpoint
+    /// When set, `discover_models()` uses Ollama's native `/api/tags` endpoint
     /// (and optionally `/api/show` for per-model metadata) instead of the
     /// OpenAI-compatible `/v1/models` endpoint.  The value is the Ollama host
     /// root (e.g. `"http://localhost:11434"`) so the native API can be called
@@ -114,7 +114,7 @@ impl OpenAiCompatProvider {
         base_url: impl Into<String>,
     ) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -152,8 +152,23 @@ impl OpenAiCompatProvider {
     }
 
     /// Override the base URL (e.g. from a user-supplied --api-base flag).
+    ///
+    /// When the provider uses Ollama's native API host (set by the `ollama()`
+    /// factory), keep it in sync with the new base URL.  Otherwise health
+    /// checks and native model discovery would keep targeting the original
+    /// (localhost) host even though chat completions go to the overridden
+    /// server.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        if self.quirks.ollama_native_host.is_some() {
+            let native_host = self
+                .base_url
+                .trim_end_matches('/')
+                .trim_end_matches("/v1")
+                .trim_end_matches('/')
+                .to_string();
+            self.quirks.ollama_native_host = Some(native_host);
+        }
         self
     }
 
@@ -560,7 +575,7 @@ impl OpenAiCompatProvider {
     /// Models are sorted with coding-oriented models first (names containing
     /// "code" or "coder"), then by parameter size descending, so the best
     /// local coding model naturally appears at the top.
-    async fn list_models_ollama_native(
+    async fn discover_models_ollama_native(
         &self,
         ollama_host: &str,
     ) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -622,6 +637,7 @@ impl OpenAiCompatProvider {
                     name: Self::ollama_display_name(name),
                     context_window,
                     max_output_tokens: max_output,
+                    ..Default::default()
                 },
                 is_coder,
                 param_size,
@@ -851,7 +867,36 @@ impl LlmProvider for OpenAiCompatProvider {
                 (String, String, String),
             > = std::collections::HashMap::new();
 
-            while let Some(chunk_result) = byte_stream.next().await {
+            // Bound infinite mid-stream stalls (issue #185): some
+            // OpenAI-compatible providers begin a streamed tool call and then
+            // pause indefinitely before sending the arguments. Wrap each chunk
+            // read in a generous idle timeout so a stall surfaces as an error
+            // instead of hanging forever. Each chunk resets the timer, so
+            // slow-but-progressing local models are never cut off.
+            let idle_timeout = crate::stream_idle_timeout();
+            loop {
+                let chunk_result = match tokio::time::timeout(
+                    idle_timeout,
+                    byte_stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(chunk_result)) => chunk_result,
+                    // Stream ended normally.
+                    Ok(None) => break,
+                    // No bytes for `idle_timeout` — provider stalled mid-stream.
+                    Err(_) => {
+                        yield Err(ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!(
+                                "Stream stalled: no data received for {}s; aborting to avoid hanging",
+                                idle_timeout.as_secs()
+                            ),
+                            partial_response: None,
+                        });
+                        return;
+                    }
+                };
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
@@ -1129,12 +1174,12 @@ impl LlmProvider for OpenAiCompatProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         // Use Ollama native API when configured — provides richer metadata
         // (parameter size, quantization, actual context window) than the
         // generic OpenAI-compat /v1/models endpoint.
         if let Some(ref ollama_host) = self.quirks.ollama_native_host {
-            return self.list_models_ollama_native(ollama_host).await;
+            return self.discover_models_ollama_native(ollama_host).await;
         }
 
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
@@ -1192,6 +1237,7 @@ impl LlmProvider for OpenAiCompatProvider {
                         _ => 128_000,
                     },
                     max_output_tokens: 16_384,
+                    ..Default::default()
                 })
             })
             .collect();
@@ -1293,5 +1339,28 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], json!("assistant"));
         assert_eq!(messages[1]["content"], json!("Done."));
+    }
+
+    #[test]
+    fn with_base_url_retargets_ollama_native_host() {
+        // Mirror the ollama() factory default: both the /v1 base URL and the
+        // native host point at localhost initially.
+        let provider = OpenAiCompatProvider::new("ollama", "Ollama", "http://localhost:11434/v1")
+            .with_quirks(ProviderQuirks {
+                no_api_key_required: true,
+                ollama_native_host: Some("http://localhost:11434".to_string()),
+                ..Default::default()
+            });
+
+        // Overriding the base URL with a configured remote api_base (as the
+        // registry does for `providers.ollama.api_base`) must also retarget the
+        // native host used by health_check() and native model discovery.
+        let provider = provider.with_base_url("http://192.0.2.10:11434/v1");
+
+        assert_eq!(provider.base_url, "http://192.0.2.10:11434/v1");
+        assert_eq!(
+            provider.quirks.ollama_native_host.as_deref(),
+            Some("http://192.0.2.10:11434"),
+        );
     }
 }

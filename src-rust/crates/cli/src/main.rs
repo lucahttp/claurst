@@ -186,6 +186,13 @@ struct Cli {
     #[arg(long = "mcp-config")]
     mcp_config: Option<String>,
 
+    /// Trust and auto-launch project-defined MCP servers (declared in a repo's
+    /// .claurst/settings.json) without prompting. Off by default: such servers
+    /// can run arbitrary commands, so opening an untrusted repo would otherwise
+    /// require explicit per-server approval. Intended for automation/CI.
+    #[arg(long = "trust-project-mcp", action = ArgAction::SetTrue)]
+    trust_project_mcp: bool,
+
     /// Disable auto-compaction
     #[arg(long = "no-auto-compact", action = ArgAction::SetTrue)]
     no_auto_compact: bool,
@@ -481,7 +488,14 @@ async fn main() -> anyhow::Result<()> {
     debug!(cwd = %cwd.display(), "Starting Claurst");
 
     // Load settings from disk (hierarchical: global < project)
-    let settings = Settings::load_hierarchical(&cwd).await;
+    let mut settings = Settings::load_hierarchical(&cwd).await;
+    // `--trust-project-mcp` (and automation use cases) flip on the same global
+    // trust the user could set via `trustProjectMcpServers`. Folding it into
+    // `settings` here keeps a single source of truth for the gate, including
+    // for the interactive reconnect path.
+    if cli.trust_project_mcp {
+        settings.trust_project_mcp_servers = true;
+    }
 
     // Build effective config (CLI args override settings)
     let mut config = settings.effective_config();
@@ -600,6 +614,9 @@ async fn main() -> anyhow::Result<()> {
         (String::new(), false)
     };
 
+    // Apply the user-configured request timeout (issue #175) before building any
+    // client so the Anthropic client and all providers honour it.
+    claurst_api::set_request_timeout_secs(config.resolve_request_timeout_secs_active());
     let client_config = claurst_api::client::ClientConfig {
         api_key: api_key.clone(),
         api_base: config.resolve_anthropic_api_base(),
@@ -649,7 +666,42 @@ async fn main() -> anyhow::Result<()> {
     let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
-    let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
+    //
+    // SECURITY (issue #123): project-defined MCP servers (from a repo's
+    // .claurst/settings.json) can run arbitrary commands. Gate them behind
+    // explicit trust so opening a cloned repo never auto-spawns attacker
+    // processes. User/global servers are unaffected. The untrusted project
+    // servers are surfaced to the TUI for an approval prompt, or skipped (with
+    // a notice) in headless mode unless trust was granted.
+    let mcp_project_root = claurst_core::mcp_trust::project_root_for(&cwd);
+    let mcp_decision = {
+        let store = claurst_core::mcp_trust::McpTrustStore::load();
+        claurst_core::mcp_trust::partition_mcp_servers(
+            &config.mcp_servers,
+            mcp_project_root.as_deref(),
+            settings.trust_project_mcp_servers,
+            &std::collections::HashSet::new(),
+            &store,
+        )
+    };
+    let pending_project_mcp = mcp_decision.pending.clone();
+    if !pending_project_mcp.is_empty() {
+        let names: Vec<&str> = pending_project_mcp.iter().map(|s| s.name.as_str()).collect();
+        if is_headless {
+            warn!(
+                servers = ?names,
+                "Skipping project-defined MCP server(s) pending approval. \
+                 Approve them in the interactive TUI, or pass --trust-project-mcp \
+                 (or set trustProjectMcpServers) to launch them in headless mode."
+            );
+        } else {
+            info!(
+                servers = ?names,
+                "Project-defined MCP server(s) require approval before launching."
+            );
+        }
+    }
+    let mcp_manager_arc = connect_mcp_manager_arc(&mcp_decision.allowed).await;
 
     let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
 
@@ -834,6 +886,8 @@ async fn main() -> anyhow::Result<()> {
             has_credentials,
             model_registry,
             user_question_rx,
+            pending_project_mcp,
+            mcp_project_root,
         )
         .await
     };
@@ -843,14 +897,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn connect_mcp_manager_arc(
-    config: &Config,
+    servers: &[claurst_core::config::McpServerConfig],
 ) -> Option<Arc<claurst_mcp::McpManager>> {
-    if config.mcp_servers.is_empty() {
+    if servers.is_empty() {
         return None;
     }
 
-    info!(count = config.mcp_servers.len(), "Connecting to MCP servers");
-    let mcp_manager = Arc::new(claurst_mcp::McpManager::connect_all(&config.mcp_servers).await);
+    info!(count = servers.len(), "Connecting to MCP servers");
+    let mcp_manager = Arc::new(claurst_mcp::McpManager::connect_all(servers).await);
     mcp_manager.clone().spawn_notification_poll_loop();
     Some(mcp_manager)
 }
@@ -1235,6 +1289,8 @@ async fn refresh_provider_runtime_state(
         .resolve_anthropic_auth_async()
         .await
         .unwrap_or((String::new(), false));
+    // Apply the user-configured request timeout (issue #175) before rebuilding.
+    claurst_api::set_request_timeout_secs(config.resolve_request_timeout_secs_active());
     let client_config = claurst_api::client::ClientConfig {
         api_key,
         api_base: config.resolve_anthropic_api_base(),
@@ -1622,6 +1678,8 @@ async fn run_interactive(
     has_credentials: bool,
     model_registry: Arc<claurst_api::ModelRegistry>,
     user_question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
+    pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
+    mcp_project_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -1702,8 +1760,18 @@ async fn run_interactive(
 
 
     // Set up terminal
-    let mut terminal = setup_terminal()?;
+    let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    // Gate input shift-normalization on whether the terminal speaks the kitty
+    // keyboard protocol (detected in setup_terminal). On terminals that don't —
+    // Windows conhost / CMD / legacy PowerShell, etc. — printable keys already
+    // arrive as their final character, so re-shifting them would corrupt input
+    // (issue #183: typing `/` produced `?`).
+    app.kitty_keyboard_active = claurst_tui::keyboard_enhancement_active();
+    // Seed the project-MCP approval queue: untrusted project servers that the
+    // user must approve before they are allowed to launch (issue #123).
+    app.mcp_project_root = mcp_project_root;
+    app.mcp_pending_project = pending_project_mcp.into_iter().collect();
     if let Some(warning) = resume_warning {
         app.status_message = Some(warning);
     }
@@ -2390,7 +2458,9 @@ async fn run_interactive(
                                             eprintln!("\nLogin failed: {}", e);
                                         }
                                     }
-                                    terminal = claurst_tui::setup_terminal()?;
+                                    terminal = claurst_tui::setup_terminal(app.config.mouse_capture_enabled())?;
+                                    app.kitty_keyboard_active =
+                                        claurst_tui::keyboard_enhancement_active();
                                 }
                                 Some(CommandResult::StartLoginForProvider {
                                     provider,
@@ -2455,7 +2525,9 @@ async fn run_interactive(
                                             }
                                         }
                                     }
-                                    terminal = claurst_tui::setup_terminal()?;
+                                    terminal = claurst_tui::setup_terminal(app.config.mouse_capture_enabled())?;
+                                    app.kitty_keyboard_active =
+                                        claurst_tui::keyboard_enhancement_active();
                                 }
                                 Some(CommandResult::Error(e)) => {
                                     app.status_message = Some(format!("Error: {}", e));
@@ -3352,7 +3424,14 @@ async fn run_interactive(
                         .strip_prefix(&provider_prefix)
                         .unwrap_or(app.model_name.as_str())
                         .to_string();
-                    app.model_picker.set_models(entries);
+                    // Only let a live-discovery result replace the list when it
+                    // actually returned models. An empty result — catalog-backed
+                    // provider (now the trait default), an unreachable endpoint,
+                    // or a missing entitlement — must never wipe the registry
+                    // projection set when the picker opened.
+                    if !entries.is_empty() {
+                        app.model_picker.set_models(entries);
+                    }
                     for m in &mut app.model_picker.models {
                         m.is_current = m.id == current;
                     }
@@ -3404,7 +3483,7 @@ async fn run_interactive(
                     app.model_fetch_rx = Some(rx);
                     app.model_picker.loading_models = true;
                     tokio::spawn(async move {
-                        match provider.list_models().await {
+                        match provider.discover_models().await {
                             Ok(models) => {
                                 let entries: Vec<claurst_tui::model_picker::ModelEntry> = models
                                     .into_iter()
@@ -3816,7 +3895,18 @@ async fn run_interactive(
         }
 
         if !app.is_streaming && current_query.is_none() && app.take_pending_mcp_reconnect() {
-            let new_mcp_manager = connect_mcp_manager_arc(&cmd_ctx.config).await;
+            // Re-apply the project-MCP trust gate on reconnect: only user
+            // servers plus project servers approved this session, persisted, or
+            // globally trusted are launched (issue #123).
+            let store = claurst_core::mcp_trust::McpTrustStore::load();
+            let decision = claurst_core::mcp_trust::partition_mcp_servers(
+                &cmd_ctx.config.mcp_servers,
+                app.mcp_project_root.as_deref(),
+                settings.trust_project_mcp_servers,
+                &app.mcp_session_trusted,
+                &store,
+            );
+            let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
             tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
@@ -3837,6 +3927,16 @@ async fn run_interactive(
                     if connected == 1 { "" } else { "s" }
                 )
             });
+        }
+
+        // Prompt for any project-defined MCP servers awaiting approval (#123).
+        // Hold off while the startup bypass-permissions dialog is up so the two
+        // modals don't fight over the screen.
+        if !app.is_streaming
+            && current_query.is_none()
+            && !app.bypass_permissions_dialog.visible
+        {
+            app.maybe_prompt_next_mcp_server();
         }
 
         if app.should_exit {

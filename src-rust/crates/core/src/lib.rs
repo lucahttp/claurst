@@ -81,8 +81,8 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
-pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result, load_env_from_claude_settings};
+pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
@@ -651,6 +651,11 @@ pub mod config {
         100  // 100 KB
     }
 
+    /// Default total request timeout (seconds) when the user has not configured
+    /// one. Generous so slow local models (CPU inference, large MoE) that can
+    /// take several minutes to first token are not cut off prematurely.
+    pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+
     /// Definition of a named agent with per-agent model, permissions,
     /// temperature, and system prompt.
     pub fn api_key_env_vars_for_provider(provider_id: &str) -> &'static [&'static str] {
@@ -900,6 +905,17 @@ pub mod config {
         /// Provider-specific options (passed through to provider implementation)
         #[serde(default)]
         pub options: HashMap<String, serde_json::Value>,
+        /// Total request timeout in seconds for this provider's HTTP client.
+        /// Overrides the global [`Config::request_timeout_secs`] when set.
+        /// Useful for slow local models (CPU inference, large MoE) that can take
+        /// several minutes to first token. `None` falls back to the global value.
+        #[serde(
+            default,
+            rename = "requestTimeoutSecs",
+            alias = "request_timeout_secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub request_timeout_secs: Option<u64>,
     }
 
     impl Default for ProviderConfig {
@@ -911,6 +927,7 @@ pub mod config {
                 models_whitelist: Vec::new(),
                 models_blacklist: Vec::new(),
                 options: HashMap::new(),
+                request_timeout_secs: None,
             }
         }
     }
@@ -995,6 +1012,26 @@ pub mod config {
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
         #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
         pub file_injection_max_size: usize,
+        /// Total request timeout in seconds applied to provider HTTP clients.
+        /// Slow local models (CPU inference, large MoE) can take several minutes
+        /// to first token; raise this to avoid premature cut-off. `None` (or 0)
+        /// uses [`DEFAULT_REQUEST_TIMEOUT_SECS`]. Per-provider overrides live on
+        /// [`ProviderConfig::request_timeout_secs`].
+        #[serde(
+            default,
+            rename = "requestTimeoutSecs",
+            alias = "request_timeout_secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub request_timeout_secs: Option<u64>,
+        /// Whether app-level mouse capture is enabled. `None` (default) or
+        /// `Some(true)` means claurst captures the mouse for scroll / right-click
+        /// context menu / middle-click paste / drag text-selection. Set
+        /// `"mouseCapture": false` to release the mouse to the terminal so native
+        /// click-drag selection and copy/paste work without lag (issue #104).
+        /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
+        #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
+        pub mouse_capture: Option<bool>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1027,6 +1064,27 @@ pub mod config {
         StreamJson,
     }
 
+    /// Where an MCP server definition came from.
+    ///
+    /// This is a *runtime* classification used to gate auto-launching of
+    /// servers that can run arbitrary commands. It is deliberately NEVER
+    /// (de)serialized from the settings file (see `#[serde(skip)]` on
+    /// `McpServerConfig::origin`): a repository's `.claurst/settings.json`
+    /// must not be able to forge `User` to bypass the trust gate. The origin
+    /// is always assigned in code at load time.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+    pub enum McpServerOrigin {
+        /// Defined in the user's global `~/.claurst/settings.json`, supplied
+        /// on the command line (`--mcp-config`), or contributed by an
+        /// explicitly-enabled plugin. Considered trusted: auto-connects.
+        #[default]
+        User,
+        /// Defined in a repository's project-level `.claurst/settings.json`.
+        /// Untrusted until the user approves it, because opening a cloned repo
+        /// would otherwise spawn an attacker-controlled process (RCE).
+        Project,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct McpServerConfig {
         pub name: String,
@@ -1038,6 +1096,11 @@ pub mod config {
         pub url: Option<String>,
         #[serde(rename = "type", default = "default_mcp_type")]
         pub server_type: String,
+        /// Origin of this definition. Never read from JSON (always `User` on
+        /// deserialize); set to `Project` in `find_project_settings` for
+        /// servers loaded from a repo. See [`McpServerOrigin`].
+        #[serde(skip)]
+        pub origin: McpServerOrigin,
     }
 
     fn default_mcp_type() -> String {
@@ -1068,6 +1131,13 @@ pub mod config {
         pub projects: HashMap<String, ProjectSettings>,
         #[serde(default, rename = "remoteControlAtStartup")]
         pub remote_control_at_startup: bool,
+        /// Global opt-in: trust and auto-launch project-defined MCP servers
+        /// (those declared in a repository's `.claurst/settings.json`) without
+        /// prompting. Defaults to `false`. Leaving it off means project servers
+        /// must be approved per-project before they can spawn a process.
+        /// Prefer per-project approval over flipping this on globally.
+        #[serde(default, rename = "trustProjectMcpServers")]
+        pub trust_project_mcp_servers: bool,
         /// Persisted permission rules saved by the user across sessions.
         #[serde(default, rename = "permissionRules")]
         pub permission_rules: Vec<crate::permissions::SerializedPermissionRule>,
@@ -1233,6 +1303,14 @@ pub mod config {
     }
 
     impl Config {
+        /// Whether app-level mouse capture should be enabled. Defaults to `true`
+        /// (capture on) when unset, preserving historical behaviour; users opt out
+        /// via `"mouseCapture": false` to restore native terminal text selection
+        /// and copy/paste (issue #104).
+        pub fn mouse_capture_enabled(&self) -> bool {
+            self.mouse_capture.unwrap_or(true)
+        }
+
         pub fn selected_provider_id(&self) -> &str {
             self.provider
                 .as_deref()
@@ -1265,6 +1343,10 @@ pub mod config {
                 Some("togetherai") | Some("together-ai") => "meta-llama/Llama-3.3-70B-Instruct-Turbo",
                 Some("perplexity") => "sonar-pro",
                 Some("cohere") => "command-r-plus",
+                // DashScope runs as "qwen" at runtime but is "alibaba" in the
+                // models.dev catalog; terminal fallback keeps a qwen id so an
+                // unconfigured Qwen provider never resolves to a claude-* model.
+                Some("qwen") | Some("alibaba") => "qwen3-max",
                 Some("deepinfra") => "meta-llama/Llama-3.3-70B-Instruct",
                 Some("github-copilot") => "gpt-4o",
                 Some("ollama") => "llama3.2",
@@ -1468,6 +1550,25 @@ pub mod config {
             self.resolve_provider_api_base(self.selected_provider_id())
                 .unwrap_or_else(|| self.resolve_anthropic_api_base())
         }
+
+        /// Resolve the total request timeout (in seconds) for `provider_id`.
+        ///
+        /// Precedence: per-provider [`ProviderConfig::request_timeout_secs`] >
+        /// global [`Config::request_timeout_secs`] > [`DEFAULT_REQUEST_TIMEOUT_SECS`].
+        /// Zero values are treated as unset.
+        pub fn resolve_request_timeout_secs(&self, provider_id: &str) -> u64 {
+            self.provider_configs
+                .get(provider_id)
+                .and_then(|provider| provider.request_timeout_secs)
+                .filter(|&secs| secs > 0)
+                .or_else(|| self.request_timeout_secs.filter(|&secs| secs > 0))
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS)
+        }
+
+        /// Resolve the request timeout for the active provider.
+        pub fn resolve_request_timeout_secs_active(&self) -> u64 {
+            self.resolve_request_timeout_secs(self.selected_provider_id())
+        }
     }
 
     impl Settings {
@@ -1608,7 +1709,20 @@ pub mod config {
                     if candidate.exists() && candidate != global_path {
                         if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
                             let stripped = strip_jsonc_comments(&content);
-                            if let Ok(s) = serde_json::from_str::<Self>(&stripped) {
+                            if let Ok(mut s) = serde_json::from_str::<Self>(&stripped) {
+                                // SECURITY: tag every server defined by this
+                                // repository as project-origin so it gets gated
+                                // behind explicit approval before launching.
+                                // `origin` is `#[serde(skip)]`, so the file can
+                                // never set it itself — we always assign here.
+                                for server in &mut s.config.mcp_servers {
+                                    server.origin = McpServerOrigin::Project;
+                                }
+                                for ps in s.projects.values_mut() {
+                                    for server in &mut ps.mcp_servers {
+                                        server.origin = McpServerOrigin::Project;
+                                    }
+                                }
                                 return Some(s);
                             }
                         }
@@ -1679,17 +1793,25 @@ pub mod config {
                 },
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
+                mouse_capture: over.config.mouse_capture.or(base.config.mouse_capture),
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
+                request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
             };
             Self {
                 config: merged_config,
                 version: over.version.or(base.version),
                 projects: merge_map(base.projects, over.projects),
                 remote_control_at_startup: over.remote_control_at_startup || base.remote_control_at_startup,
+                // SECURITY: only the user's global settings may grant blanket
+                // trust to project MCP servers. A project's own settings file
+                // (`over`) must NOT be able to flip this on — otherwise a
+                // malicious repo could set `trustProjectMcpServers: true` to
+                // bypass the approval gate entirely.
+                trust_project_mcp_servers: base.trust_project_mcp_servers,
                 permission_rules: { let mut v = base.permission_rules; v.extend(over.permission_rules); v },
                 enabled_plugins: { let mut s = base.enabled_plugins; s.extend(over.enabled_plugins); s },
                 disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
@@ -1792,6 +1914,92 @@ pub mod config {
             }
         }
         result
+    }
+
+    #[cfg(test)]
+    mod request_timeout_tests {
+        use super::*;
+
+        #[test]
+        fn defaults_to_600_when_unset() {
+            let config = Config::default();
+            assert_eq!(config.request_timeout_secs, None);
+            assert_eq!(
+                config.resolve_request_timeout_secs("openai"),
+                DEFAULT_REQUEST_TIMEOUT_SECS
+            );
+            assert_eq!(DEFAULT_REQUEST_TIMEOUT_SECS, 600);
+        }
+
+        #[test]
+        fn global_request_timeout_serde_roundtrips_with_camelcase_key() {
+            let mut config = Config::default();
+            config.request_timeout_secs = Some(1800);
+            // Serialises with the documented camelCase key.
+            let json = serde_json::to_string(&config).expect("serialise");
+            assert!(
+                json.contains("\"requestTimeoutSecs\":1800"),
+                "expected camelCase key in: {json}"
+            );
+            // Round-trips back and threads through the resolver.
+            let parsed: Config = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(parsed.request_timeout_secs, Some(1800));
+            assert_eq!(parsed.resolve_request_timeout_secs("ollama"), 1800);
+        }
+
+        #[test]
+        fn snake_case_alias_also_parses() {
+            // Patch a fully-serialised config to use the snake_case alias and
+            // confirm it still deserialises (back-compat with snake_case keys).
+            let mut value =
+                serde_json::to_value(Config::default()).expect("to_value");
+            let obj = value.as_object_mut().unwrap();
+            obj.remove("requestTimeoutSecs");
+            obj.insert(
+                "request_timeout_secs".to_string(),
+                serde_json::json!(900),
+            );
+            let parsed: Config =
+                serde_json::from_value(value).expect("alias should parse");
+            assert_eq!(parsed.request_timeout_secs, Some(900));
+        }
+
+        #[test]
+        fn per_provider_override_wins_over_global() {
+            let mut config = Config::default();
+            config.request_timeout_secs = Some(1200);
+            let mut provider = ProviderConfig::default();
+            provider.request_timeout_secs = Some(3600);
+            config
+                .provider_configs
+                .insert("ollama".to_string(), provider);
+            // Per-provider override applies to ollama.
+            assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
+            // Other providers fall back to the global value.
+            assert_eq!(config.resolve_request_timeout_secs("openai"), 1200);
+        }
+
+        #[test]
+        fn effective_config_merges_top_level_provider_timeout() {
+            let mut settings = Settings::default();
+            settings.config.request_timeout_secs = Some(1200);
+            let mut provider = ProviderConfig::default();
+            provider.request_timeout_secs = Some(3600);
+            settings.providers.insert("ollama".to_string(), provider);
+            let config = settings.effective_config();
+            assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
+            assert_eq!(config.resolve_request_timeout_secs("openai"), 1200);
+        }
+
+        #[test]
+        fn zero_is_treated_as_unset() {
+            let mut config = Config::default();
+            config.request_timeout_secs = Some(0);
+            assert_eq!(
+                config.resolve_request_timeout_secs("openai"),
+                DEFAULT_REQUEST_TIMEOUT_SECS
+            );
+        }
     }
 }
 
@@ -3912,6 +4120,7 @@ pub mod effort;
 pub mod prompt_history;
 pub mod bash_classifier;
 pub mod ps_classifier;
+pub mod mcp_trust;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry
@@ -4099,6 +4308,52 @@ mod tests {
         assert!(cfg.hooks.is_empty());
     }
 
+    /// Security (issue #123): MCP servers declared in a repository's
+    /// `.claurst/settings.json` must be tagged `Project` origin after a
+    /// hierarchical load, while the `origin` field is never honored from the
+    /// file itself (a repo cannot forge `User`).
+    #[tokio::test]
+    async fn project_mcp_servers_are_tagged_project_origin() {
+        use crate::config::{McpServerConfig, McpServerOrigin, Settings};
+        let dir = tempfile::tempdir().unwrap();
+        let claurst = dir.path().join(".claurst");
+        std::fs::create_dir_all(&claurst).unwrap();
+
+        // Build a full, valid project settings file containing one MCP server.
+        // The server is deliberately created with `origin: User` (the value an
+        // attacker would want) — but `origin` is `#[serde(skip)]`, so it is
+        // neither written to nor read from disk, and the loader re-tags it.
+        let mut project = Settings::default();
+        project.config.mcp_servers.push(McpServerConfig {
+            name: "evil".to_string(),
+            command: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), "id".to_string()],
+            env: std::collections::HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            origin: McpServerOrigin::User,
+        });
+        let json = serde_json::to_string_pretty(&project).unwrap();
+        assert!(
+            !json.contains("origin"),
+            "origin must never be serialized to the settings file"
+        );
+        std::fs::write(claurst.join("settings.json"), json).unwrap();
+
+        let merged = Settings::load_hierarchical(dir.path()).await;
+        let server = merged
+            .config
+            .mcp_servers
+            .iter()
+            .find(|s| s.name == "evil")
+            .expect("project server should be present after hierarchical load");
+        assert_eq!(
+            server.origin,
+            McpServerOrigin::Project,
+            "project-defined server must be tagged Project origin and cannot forge User"
+        );
+    }
+
     #[test]
     fn test_cost_tracker() {
         let tracker = CostTracker::new();
@@ -4120,6 +4375,44 @@ mod tests {
     }
 
     // ---- Config tests -------------------------------------------------------
+
+    #[test]
+    fn test_config_mouse_capture_defaults_on() {
+        // Unset (None) must read as enabled to preserve historical behaviour.
+        let cfg = crate::config::Config::default();
+        assert_eq!(cfg.mouse_capture, None);
+        assert!(cfg.mouse_capture_enabled());
+    }
+
+    #[test]
+    fn test_config_mouse_capture_explicit_off() {
+        let mut cfg = crate::config::Config::default();
+        cfg.mouse_capture = Some(false);
+        assert!(!cfg.mouse_capture_enabled());
+        cfg.mouse_capture = Some(true);
+        assert!(cfg.mouse_capture_enabled());
+    }
+
+    #[test]
+    fn test_config_mouse_capture_serde_roundtrip() {
+        // Unset round-trips as None and is omitted from the serialized JSON
+        // (skip_serializing_if), so existing settings files stay unchanged.
+        let cfg = crate::config::Config::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("mouseCapture"));
+        let back: crate::config::Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mouse_capture, None);
+        assert!(back.mouse_capture_enabled());
+
+        // Explicit off serializes the key and round-trips as disabled.
+        let mut cfg = crate::config::Config::default();
+        cfg.mouse_capture = Some(false);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"mouseCapture\":false"));
+        let back: crate::config::Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mouse_capture, Some(false));
+        assert!(!back.mouse_capture_enabled());
+    }
 
     #[test]
     fn test_config_effective_model_default() {
